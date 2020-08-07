@@ -1,0 +1,26 @@
+[package]
+name = "nakala"
+version = "0.0.0"  #:version
+authors = ["Andrew Gallant <jamslam@gmail.com>"]
+description = """
+A low level information retrieval library.
+"""
+documentation = "https://docs.rs/nakala"
+homepage = "https://github.com/BurntSushi/nakala"
+repository = "https://github.com/BurntSushi/nakala"
+readme = "README.md"
+keywords = ["information", "retrieval", "fuzzy", "search", "ngram"]
+license = "Unlicense OR MIT"
+edition = "2018"
+
+[lib]
+bench = false
+
+[dependencies]
+fst = "0.4.4"
+
+[profile.release]
+debug = true
+
+[profile.test]
+opt-level = 3
