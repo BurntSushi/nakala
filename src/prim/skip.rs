@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use crate::error::FormatError;
+use crate::error::{FormatContext, FormatError};
 use crate::prim::{ReadCursor, WriteCursor};
 
 /// A skip list reader.
@@ -32,22 +32,26 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    /// Create a new reader for a skip list. The cursor given should be
-    /// positioned at the beginning of the skip list, but it may continue
-    /// beyond the skip list. That is, for a correctly encoded skip list, this
-    /// cursor will never read beyond the skip list.
+    /// Create a new reader for a skip list. The cursor given may begin
+    /// anywhere, but must end immediately where the skip list ends.
     pub fn new(cursor: ReadCursor<'a>) -> Result<Reader<'a>, FormatError> {
-        let levels = cursor.read_usize_le().map_err(|e| {
-            FormatError::err(e).context("failed to read skip list levels")
-        })?;
-        let min = cursor.read_u32_le().map_err(|e| {
-            FormatError::err(e).context("failed to read min skip list value")
-        })?;
-        let max = cursor.read_u32_le().map_err(|e| {
-            FormatError::err(e).context("failed to read max skip list value")
-        })?;
-        let start = cursor.pos();
-        Ok(Reader { cursor, levels, min, max, start })
+        // start (u64) + levels (u64) + min (u32) + max (u32)
+        cursor.set_pos_rev(8 + 8 + 4 + 4)?;
+        let start = cursor
+            .read_usize_le()
+            .context("failed to read skip start offset")?;
+        let levels = cursor
+            .read_usize_le()
+            .context("failed to read skip list levels")?;
+        let min = cursor
+            .read_u32_le()
+            .context("failed to read min skip list value")?;
+        let max = cursor
+            .read_u32_le()
+            .context("failed to read max skip list value")?;
+        // Ensure that the starting position is correct.
+        cursor.set_pos(start).context("invalid skip list start offset")?;
+        Ok(Reader { cursor, start, levels, min, max })
     }
 
     /// Return the number of levels in this skip list.
@@ -83,9 +87,9 @@ impl<'a> Reader<'a> {
 
         let mut level = 0;
         let last_level = self.levels() - 1;
-        // The starting position is derived from the position of the cursor
-        // at construction, so it can never be invalid.
-        self.cursor.set_pos(self.start).unwrap();
+        // Constructor of this reader checks that the start offset is valid,
+        // so this will always exceed.
+        self.cursor.set_pos(self.start).expect("already verified");
         loop {
             // val is the maximum value indexed by this parent and all of its
             // children ...
@@ -95,19 +99,21 @@ impl<'a> Reader<'a> {
                 // move to the next sibling ...
                 if level == last_level {
                     // ... if we're on the last level, then the sibling is
-                    // adjacent to this skip block, once we read (and discard)
-                    // this block's offset.
+                    // encoded after the offset, so read past the offset to
+                    // get the sibling.
                     let _ = self.read_last_level_offset()?;
+                    let next_sibling = self.read_next_sibling()?;
+                    self.cursor.set_pos(next_sibling).context(
+                        "failed to set skip position to next sibling",
+                    )?;
                 } else {
                     // ... otherwise, we know that there is no skip block
                     // beneath this one, so we should move to the next sibling,
                     // which is the next u32LE.
                     let next_sibling = self.read_next_sibling()?;
-                    self.cursor.set_pos(next_sibling).map_err(|e| {
-                        FormatError::err(e).context(
-                            "failed to set skip position to next sibling",
-                        )
-                    })?;
+                    self.cursor.set_pos(next_sibling).context(
+                        "failed to set skip position to next sibling",
+                    )?;
                 }
             } else {
                 // ... otherwise, the skip block we want is either this one
@@ -128,18 +134,17 @@ impl<'a> Reader<'a> {
     /// Reads the target value at the beginning of this skip entry. The cursor
     /// must be positioned at the beginning of a skip entry.
     fn read_target_value(&self) -> Result<u32, FormatError> {
-        self.cursor.read_u32_le().map_err(|e| {
-            FormatError::err(e).context("failed to read skip target value")
-        })
+        self.cursor.read_u32_le().context("failed to read skip target value")
     }
 
     /// Reads the next sibling offset encoded at the current position.
     ///
     /// If the sibling offset is invalid, then this returns an error.
     fn read_next_sibling(&self) -> Result<usize, FormatError> {
-        let next_sibling = self.cursor.read_usize_le().map_err(|e| {
-            FormatError::err(e).context("failed to read next sibling offset")
-        })?;
+        let next_sibling = self
+            .cursor
+            .read_usize_le()
+            .context("failed to read next sibling offset")?;
         // The reader should never move backwards as a result of skipping to
         // the next sibling in this level. We insert this check for better
         // error handling and to prevent potential infinite loops on a
@@ -147,7 +152,7 @@ impl<'a> Reader<'a> {
         //
         // A next_sibling of 0 indicates that this is the final skip entry, and
         // so has no next sibling.
-        if next_sibling != 0 && next_sibling < self.cursor.pos() {
+        if next_sibling != 0 && next_sibling >= self.cursor.pos() {
             bail_format!(
                 "invalid sibling offset {} at position {}",
                 next_sibling,
@@ -161,10 +166,9 @@ impl<'a> Reader<'a> {
     /// on the last level. The cursor should be positioned just after the
     /// target value for the last block.
     fn read_last_level_offset(&self) -> Result<usize, FormatError> {
-        self.cursor.read_usize_le().map_err(|e| {
-            FormatError::err(e)
-                .context("failed to read last level skip offset")
-        })
+        self.cursor
+            .read_usize_le()
+            .context("failed to read last level skip offset")
     }
 }
 
@@ -176,17 +180,8 @@ impl<'a> Reader<'a> {
 ///
 /// Skip lists produced by this writer are not amenable to subsequent
 /// modification.
-///
-/// Note that a `SkipWriter` requires buffering the skip list in memory.
-/// Because of this, it may be beneficial to reuse skip lists to amortize the
-/// cost of allocating said memory.
 #[derive(Clone, Debug)]
 pub struct Writer {
-    /// An in memory buffer for writing the skip list.
-    ///
-    /// We use this in memory buffer because we need to be able to write
-    /// sibling offsets in previously written skip entries.
-    buf: WriteCursor<Vec<u8>>,
     /// A sequence of skip values and offsets associated with each value.
     ///
     /// For doc ids, each skip in this sequence corresponds to a *block* of
@@ -213,32 +208,44 @@ pub struct Writer {
     /// entries that are skipped at this level.
     levels: Vec<usize>,
     /// A map where the keys are levels and the values are optional offsets
-    /// into `buf` corresponding to the level's previous sibling. The offset
-    /// points at a location where a u32LE can be written, where that number
-    /// should point to the beginning of its subsequent sibling.
+    /// corresponding to the level's next sibling. The offset points at a
+    /// location where a u32LE can be written, where that number should point
+    /// to the beginning of its subsequent sibling.
     ///
-    /// If not previous sibling exists (yet) for a particular level, then there
-    /// is no offset for it.
-    ///
-    /// Note that these offsets are only applicable for parent levels. The
-    /// entries in the lowest level are written contiguous, so they do not need
-    /// explicit sibling pointers.
-    prev_sibling_level_hole: Vec<Option<usize>>,
+    /// A "next" sibling doesn't exist for the last skip entries, in which
+    /// case, a special offset of `0` is written.
+    next_sibling_hole: Vec<Option<usize>>,
 }
 
-/// An explicitly buffered writer for skip lists.
+/// The actual implementation of writing a skip list.
 ///
-/// This is a snapshot of some state produced by `SkipWriter`, from which the
-/// actual skip list can be written.
+/// This is a snapshot of some state produced by `Writer`, from which the
+/// actual skip list can be written. It exists because the public `Writer`
+/// type collects all of the skip entries, but the `WriterImp` is actually
+/// responsible for serializing them to bytes once we're ready.
+///
+/// It also amortizes a few allocations, but this probably isn't
+/// necessary, since they are proportional to the number of levels in the skip
+/// list (which should always be very small). Otherwise, this streams the
+/// skip entries to the underlying writer by writing them in reverse. Writing
+/// them in reverse is necessary because each entry points to its next sibling
+/// in sequence. If we didn't write them in reverse, then we'd either need
+/// to buffer everything or require a seekable writer to backfill the sibling
+/// positions.
+///
+/// TODO: Since the number of levels is fixed, and everything in the skip
+/// list is of fixed size, it seems like it should be possible to compute the
+/// sibling offsets without needing to explicitly store them... But I was not
+/// smart enough to figure this out.
 #[derive(Debug)]
-struct BufWriter<'a> {
-    buf: &'a mut WriteCursor<Vec<u8>>,
+struct WriterImp<'a, W> {
+    wtr: &'a mut WriteCursor<W>,
     skips: &'a [Skip],
     skip_size: usize,
     levels: &'a [usize],
     min: u32,
     max: u32,
-    prev_sibling_level_hole: &'a mut [Option<usize>],
+    next_sibling_hole: &'a mut [Option<usize>],
 }
 
 /// A single skip entry.
@@ -259,13 +266,12 @@ impl Writer {
     /// Create a new skip writer with the given skip size.
     pub fn with_skip_size(skip_size: usize) -> Writer {
         Writer {
-            buf: WriteCursor::new(vec![]),
             skips: vec![],
             skip_size: skip_size,
             levels: vec![],
             min: 0,
             max: 0,
-            prev_sibling_level_hole: vec![],
+            next_sibling_hole: vec![],
         }
     }
 
@@ -288,12 +294,11 @@ impl Writer {
 
     /// Reset this writer such that it can be reused.
     pub fn clear(&mut self) {
-        self.buf.clear();
         self.skips.clear();
         self.levels.clear();
         self.min = 0;
         self.max = 0;
-        self.prev_sibling_level_hole.clear();
+        self.next_sibling_hole.clear();
     }
 
     /// Write this skip list to the given writer.
@@ -308,7 +313,7 @@ impl Writer {
         &mut self,
         wtr: &mut WriteCursor<W>,
     ) -> Result<(), FormatError> {
-        self.buf_writer().write_to(wtr)?;
+        self.writer(wtr).write()?;
         self.clear();
         Ok(())
     }
@@ -318,12 +323,14 @@ impl Writer {
     ///
     /// Buffering is necessary to backfill offsets to subsequent siblings
     /// within the same level.
-    fn buf_writer(&mut self) -> BufWriter {
+    fn writer<'a, W: io::Write>(
+        &'a mut self,
+        wtr: &'a mut WriteCursor<W>,
+    ) -> WriterImp<'a, W> {
         // This method does all the house-keeping work before we can start
         // writing our skip list.
-        self.buf.clear();
         self.levels.clear();
-        self.prev_sibling_level_hole.clear();
+        self.next_sibling_hole.clear();
 
         // The number of skip values is the number of remaining values provided
         // by the user to index by the skip list. The number of skip values
@@ -338,7 +345,7 @@ impl Writer {
         num_skip_values /= self.skip_size;
         while num_skip_values > 0 {
             self.levels.push(level_length);
-            self.prev_sibling_level_hole.push(None);
+            self.next_sibling_hole.push(None);
             level_length *= self.skip_size;
             num_skip_values /= self.skip_size;
         }
@@ -346,43 +353,46 @@ impl Writer {
         // is the top-most level (where a sibling traversal at level 0 skips
         // the most values).
         self.levels.reverse();
-        BufWriter {
-            buf: &mut self.buf,
+        WriterImp {
+            wtr,
             skips: &self.skips,
             skip_size: self.skip_size,
             levels: &self.levels,
             min: self.min,
             max: self.max,
-            prev_sibling_level_hole: &mut self.prev_sibling_level_hole,
+            next_sibling_hole: &mut self.next_sibling_hole,
         }
     }
 }
 
-impl<'a> BufWriter<'a> {
+impl<'a, W: io::Write> WriterImp<'a, W> {
     /// Write this skip list to the given writer.
-    fn write_to<W: io::Write>(
-        &mut self,
-        wtr: &mut WriteCursor<W>,
-    ) -> Result<(), FormatError> {
-        wtr.write_usize_le(self.levels.len())?;
-        wtr.write_u32_le(self.min)?;
-        wtr.write_u32_le(self.max)?;
-        // If we didn't add any levels, then a skip list is not needed.
-        if self.levels.is_empty() {
-            return Ok(());
-        }
-        for (i, skip) in self.skips.iter().enumerate() {
+    fn write(&mut self) -> Result<(), FormatError> {
+        // start marks the position at which the top-most skip entry is
+        // encoded. We actually encode our skip entries backwards, since each
+        // skip entry needs to point to its next sibling in sequence. If we
+        // don't encode the entries backwards, then we'd need to buffer the
+        // entire skip list in order to backfill the sibling offsets.
+        let mut start = if self.levels.is_empty() { Some(0) } else { None };
+        for (i, skip) in self.skips.iter().enumerate().rev() {
             for (level, &skip_every) in self.levels.iter().enumerate() {
                 if i % skip_every != 0 {
                     continue;
                 }
-                self.fill_prev_sibling_hole(wtr.pos(), level);
+                if i == 0 && level == 0 {
+                    start = Some(self.wtr.pos());
+                }
                 self.write_skip(i, level)?;
             }
         }
-        wtr.write_all(self.buf.get_ref()).map_err(|e| {
-            FormatError::err(e).context("failed to write skip list to writer")
-        })?;
+        self.wtr
+            .write_usize_le(start.expect("first skip is always visited"))
+            .context("failed to write skip start")?;
+        self.wtr
+            .write_usize_le(self.levels.len())
+            .context("failed to write skip levels")?;
+        self.wtr.write_u32_le(self.min).context("failed to write skip min")?;
+        self.wtr.write_u32_le(self.max).context("failed to write skip min")?;
         Ok(())
     }
 
@@ -398,34 +408,30 @@ impl<'a> BufWriter<'a> {
     ) -> Result<(), FormatError> {
         assert!(skip_index % self.skip_every(level) == 0);
 
+        let entry_start = self.wtr.pos();
+
         let skip_value = self.skip_value(skip_index, level);
-        self.buf.write_u32_le(skip_value)?;
+        self.wtr
+            .write_u32_le(skip_value)
+            .context("failed to write skip value")?;
+        // Only the last level actually associates skip values with offsets.
         if level == self.last_level() {
-            self.buf.write_usize_le(self.skips[skip_index].offset)?;
-        } else {
-            self.prev_sibling_level_hole[level] = Some(self.buf.pos());
-            self.buf.write_usize_le(0)?;
+            self.wtr
+                .write_usize_le(self.skips[skip_index].offset)
+                .context("failed to write last level skip offset")?;
         }
+        self.wtr
+            .write_usize_le(self.next_sibling(level))
+            .context("failed to write next sibling offset")?;
+
+        self.next_sibling_hole[level] = Some(entry_start);
         Ok(())
     }
 
-    /// Set the sibling offset for the previous sibling of the given level.
-    ///
-    /// The offset set here permits quickly skipping along the siblings of a
-    /// level.
-    ///
-    /// `wtr_position` should be the position of the underlying writer, which
-    /// is used to determine the offset to write.
-    fn fill_prev_sibling_hole(&mut self, wtr_position: usize, level: usize) {
-        if level >= self.last_level() {
-            return;
-        }
-        if let Some(at) = self.prev_sibling_level_hole[level] {
-            let pos = wtr_position + self.buf.pos();
-            (&mut self.buf.get_mut()[at..])
-                .write_all(&pos.to_le_bytes())
-                .unwrap();
-        }
+    /// Return the next sibling offset that has been recorded for the given
+    /// level. If no sibling offset has been recorded, then `0` is returned.
+    fn next_sibling(&self, level: usize) -> usize {
+        self.next_sibling_hole[level].unwrap_or(0)
     }
 
     /// Return the skip value for the given skip (`skip_index`) and `level`.

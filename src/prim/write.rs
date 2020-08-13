@@ -1,7 +1,7 @@
 use std::convert::TryInto;
 use std::io::{self, Write};
 
-use crate::error::FormatError;
+use crate::error::{FormatContext, FormatError};
 use crate::prim::varint;
 
 /// Wraps any writer and records the current position in the writer.
@@ -51,16 +51,12 @@ impl<W: io::Write> Cursor<W> {
 
     /// Write a 32-bit little endian integer.
     pub fn write_u32_le(&mut self, n: u32) -> Result<(), FormatError> {
-        self.write_all(&n.to_le_bytes()).map_err(|e| {
-            FormatError::err(e).context("failed to write a u32LE")
-        })
+        self.write_all(&n.to_le_bytes()).context("failed to write a u32LE")
     }
 
     /// Write a 64-bit little endian integer.
     pub fn write_u64_le(&mut self, n: u64) -> Result<(), FormatError> {
-        self.write_all(&n.to_le_bytes()).map_err(|e| {
-            FormatError::err(e).context("failed to write a u64LE")
-        })
+        self.write_all(&n.to_le_bytes()).context("failed to write a u64LE")
     }
 
     /// Writes a usize as a 64-bit little endian integer.
@@ -94,9 +90,7 @@ impl<W: io::Write> Cursor<W> {
         bytes: &[u8],
     ) -> Result<(), FormatError> {
         self.write_varusize(bytes.len())?;
-        self.write_all(bytes).map_err(|e| {
-            FormatError::err(e).context("failed to write prefixed bytes")
-        })?;
+        self.write_all(bytes).context("failed to write prefixed bytes")?;
         Ok(())
     }
 

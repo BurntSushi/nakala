@@ -81,3 +81,16 @@ impl FormatError {
         }))
     }
 }
+
+pub trait FormatContext<T, E> {
+    fn context<S: Into<String>>(self, msg: S) -> Result<T, FormatError>;
+}
+
+impl<T, E> FormatContext<T, E> for Result<T, E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn context<S: Into<String>>(self, msg: S) -> Result<T, FormatError> {
+        self.map_err(|e| FormatError::err(e).context(msg))
+    }
+}

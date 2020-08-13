@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use fst::raw::Fst;
 
-use crate::error::FormatError;
+use crate::error::{FormatContext, FormatError};
 use crate::prim::varint;
 
 /// A cursor wraps a slice of bytes and associates it with a mutable position
@@ -206,15 +206,13 @@ impl<'a> Cursor<'a> {
     /// a varint. This returns an error if the bytes are invalid UTF-8.
     pub fn read_prefixed_str(&self) -> Result<&'a str, FormatError> {
         let bytes = self.read_prefixed_bytes()?;
-        std::str::from_utf8(bytes).map_err(|e| {
-            FormatError::err(e).context("invalid UTF-8 in fixed length string")
-        })
+        std::str::from_utf8(bytes)
+            .context("invalid UTF-8 in fixed length string")
     }
 
     /// Interpret the remaining bytes in this cursor as an FST and return it.
     pub fn read_fst(&self) -> Result<Fst<&'a [u8]>, FormatError> {
-        let fst = Fst::new(self.as_slice())
-            .map_err(|e| FormatError::err(e).context("could not read FST"))?;
+        let fst = Fst::new(self.as_slice()).context("could not read FST")?;
         self.inc(self.as_slice().len())?;
         Ok(fst)
     }

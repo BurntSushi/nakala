@@ -1,4 +1,4 @@
-use crate::error::FormatError;
+use crate::error::{FormatContext, FormatError};
 
 /// https://developers.google.com/protocol-buffers/docs/encoding#varints
 pub fn read_u64(bytes: &[u8]) -> Result<(u64, usize), FormatError> {
@@ -31,15 +31,11 @@ pub fn write_u64<W: std::io::Write>(
 ) -> Result<usize, FormatError> {
     let mut i = 0;
     while n >= 0b1000_0000 {
-        wtr.write_all(&[(n as u8) | 0b1000_0000]).map_err(|e| {
-            FormatError::err(e)
-                .context("failed to write varint continuation byte")
-        })?;
+        wtr.write_all(&[(n as u8) | 0b1000_0000])
+            .context("failed to write varint continuation byte")?;
         n >>= 7;
         i += 1;
     }
-    wtr.write_all(&[n as u8]).map_err(|e| {
-        FormatError::err(e).context("failed to write final varint byte")
-    })?;
+    wtr.write_all(&[n as u8]).context("failed to write final varint byte")?;
     Ok(i + 1)
 }
