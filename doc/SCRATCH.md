@@ -188,4 +188,135 @@ their doc ID ranges with a fresh allocation. Since everything is visited in
 lexicographic order, we can preserve the monotonicity of the doc ID ranges.
 And regenerating the map from doc ID to doc ID ranges is also trivial.
 
-## Merging segments
+## Handling deletes
+
+Deletes are a significant problem in the Lucene-style index format that Nakala
+uses. The main problem is that the index is designed to be immutable, so you
+can't just remove documents from the index in place. The only sensible approach
+is to use a method called tombstoning. This basically involves two steps:
+
+1. When the caller deletes a document, we record the doc ID of the document
+   that has been deleted in its corresponding segment. Subsequent search
+   requests consult the recorded deletes and omit results matching the deleted
+   documents.
+2. At some convenient point in the future, physically remove the documents from
+   the index. In the Lucene-style of indexing, this happens when segments are
+   merged. (That is, a merged segment will always start with zero deleted
+   documents.)
+
+For the most part, (2) is fairly simple to accommodate. When two or more
+segments are merged, we simply omit writing doc IDs to the postings that have
+been marked as deleted in its corresponding segment.
+
+(1) is the trickier part to handle. Firstly, since deletes are recorded via
+their doc ID in their respective segments and since doc IDs are internal to
+Nakala, it follows that the only reasonable way for a caller to delete a
+document is to delete it by its user ID. (We could in theory provide handles to
+a specific doc ID in a specific segment as part of search results, but omitting
+a way to delete a document by its user ID seems like a critical failing.) This
+means we need a way to quickly map a user ID to every doc ID its associated
+with in every segment. This is where the FST mapping user IDs to doc IDs
+described in the section on identifiers comes in handy.
+
+Since deletes are recorded by doc ID and since doc IDs are assigned in a
+contiguous and dense fashion, it follows that we can record deletes using a
+bitset. So we only need ceil(N/8) bytes of space to record them.
+
+The only other problem remaining is how to handle the fact that deletes are one
+of the few "mutable" aspects of Nakala index. (With the other being the current
+list of active segments.) Since Nakala wants to permit multiple processes (or
+threads) to index new documents at the same time, this implies that deleting
+documents require some kind of inter-process synchronization. We will use the
+same techniques here that we use to synchronize the addition of segments to the
+index.
+
+## Transaction log and synchronization
+
+A Nakala index is formed of zero or more segments. Every search request must be
+run against every segment, and results must be merged. Over time, as the
+number of segments increases, they are merged together into bigger segments.
+This architecture makes it possible to use limited memory to create small
+segments at first, and gradually scale by merging segments at search latencies
+start to slow down due to the number of segments.
+
+One thing required by this architecture is the ability to know which segments
+are active at any given point in time. Namely, segments that have been merged
+should no longer be searched (instead, only the merged segment should be
+consulted). A key additional constraint here is that the index should present a
+consistent view of the world during a search request. That is, search requests
+should not spontaneously fail because we decided to remove a segment that it
+was still using. And of course, all of this must be robust with respect to
+multiple writers and readers using the index at the same time. Permitting
+multiple writers is quite important, since the vast majority of the work of
+indexing new documents can be performed in parallel by simply creating distinct
+segments.
+
+The primary way in which we approach this problem is through a transaction log.
+The transaction log is the single point of truth about which segments are live
+at any particular point in time. The transaction log has only a few primitives.
+Each primitive includes a timestamp.
+
+* AddSegment(segmentID) - This indicates that a segment with the given ID has
+  been added to the index. The segment ID can be used to derive the location of
+  the segment in storage. Adding a new segment to the log faisl if there
+  already exists a live segment with the given ID.
+* StartMerge(segmentID...) - This indicates that one or more segments have
+  begun the process of being merged. The purpose of this log is to instruct
+  other processes that some set of segments are involved in a merge. This helps
+  reduce repetitive work. Adding a StartMerge log fails if it contains a
+  segment ID that is involved in an active merge.
+* CancelMerge(segmentID...) - This indicates that a prior StartMerge has been
+  stopped without finishing. The segment IDs in StartMerge remain active and
+  are now eligible for merging again.
+* EndMerge(newSegmentID, oldSegmentID...) - This indicates that a merge has
+  finished and a new segment has been added to the index. The old segment ID
+  list must correspond to a previously recorded StartMerge log, and now point
+  to segments that are no longer in the index. Adding an EndMerge log fails if
+  there is no corresponding StartMerge log, or if the new segment ID already
+  exists, or if any of the old segment IDs are no longer active or if a
+  CancelMerge operation took place.
+* Checkpoint(...) - Records the current set of active segments along with any
+  outstanding StartMerge logs with no corresponding EndMerge logs. The purpose
+  of a checkpoint is that one does not need to read any previous logs to
+  determine the active set of segments.
+
+From this log, it should be clear how to compute the active set of segments at
+any particular time. Since adding a new entry to this log should generally be
+quite cheap, and to keep things simple, we require that there can only be one
+writer to the log at any particular time. Each write will check that the new
+log is valid to add and will fail if not, based on the state of the log at the
+time of the write. We can enforce a single writer via file locking (described
+in its own section below).
+
+There are a few remaining hiccups here.
+
+Firstly, when a StartMerge is added to the log, we have no guarantee that a
+corresponding CancelMerge or EndMerge will be added. The merge process might
+die unexpectedly for example. The only real choice here as far as I can see
+is to cause an implicit CancelMerge to appear in the log if it or an EndMerge
+isn't committed within N time of the StartMerge. At that point, the segments
+will become available for merging again. If the merge just took longer than the
+timeout, then the resulting EndMerge log would fail to add because of the
+previously committed CancelMerge log. This is of course a bit wasteful, but it
+keeps the index coherent. In terms of waste, we should just try hard to avoid
+getting into scenarios where we don't commit an EndMerge in time. (In theory,
+we could introduce a ProgressMerge primtiive that indicates the merge is still
+running, which could reset the StartMerge timeout, but we should try to get by
+without that extra complexity.)
+
+One remaining hiccup here is to figure out when it's okay to actually delete
+old segments from storage. The only way to do this is to know whether there are
+any processes still reading a particular segment. It's possible to track this
+by simply recording the position in the transaction log at which a reader
+started a search. For any particular position in the log, we can compute the
+precise set of active segments. Thus, if we know that all extant readers are
+passed a certain point in the log, we could compute which segments are both no
+longer active and no longer being read from.
+
+The main problem here is of course tracking readers. Firstly, this would
+require a reader to write something to storage so that it can be seen by other
+processes. Secondly, if a reader is required to mark its position in the log,
+then it must also be required to unmark itself, which of course means that'll
+need to introduce another timeout dance like we did for merges above in the
+transaction log. (Since we cannot depend on a reader unmarking itself. It might
+be ungracefully killed without the chance to unmark itself.)
