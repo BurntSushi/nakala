@@ -188,6 +188,36 @@ their doc ID ranges with a fresh allocation. Since everything is visited in
 lexicographic order, we can preserve the monotonicity of the doc ID ranges.
 And regenerating the map from doc ID to doc ID ranges is also trivial.
 
+## Merging segments
+
+One of the main constraints of segment merging is that it should be able to
+happen with ~constant heap memory. In my mind's eye, this is nearly achievable.
+One of the key things that makes this possible is that multiple FSTs can be
+unioned together in a streaming fashion from the index. This means we can
+seamlessly merge the term index and the userID -> docID FST index described
+above. Moreover, since doc IDs are unique to each segment, we can treat all of
+them as referring to distinct documents and simply allocate new doc IDs as
+needed. When a single user ID is mapped to multiple doc IDs, even if this
+happens in multiple segments, then those duplicates are all contiguous because
+of how we allocated the doc IDs, so those can all be handled in a streaming
+fashion as well. So to can document frequencies, which are stored in a separate
+stream from doc IDs, but in correspondence.
+
+Other than things like headers, footers and miscellaneous attributes, that
+pretty much covers everything except for the skip list generated for the
+posting list for each term. There's really no way that I can see to stream
+these to disk as we need to know all of the skip entries in order to partition
+them into levels. Moreover, to avoid buffering the serialized bytes of skip
+entries, we need to write them in reverse. (Because each skip entry contains a
+pointer to its next sibling.) With that said, each skip extra is a u32 doc ID
+with a usize offset, so it's in practice quite small. Moreover, we only create
+a skip entry for each block of doc IDs and each block can contain many doc IDs.
+So the number of skip entries is quite small. Still, its size _is_ proportional
+to a part of the index size, but to my knowledge, it is the only such thing.
+(We could do away with skip lists since skipping entire blocks is itself quite
+fast, but my guess is that they are too important for speeding up conjunction
+queries to throw them away.)
+
 ## Handling deletes
 
 Deletes are a significant problem in the Lucene-style index format that Nakala
