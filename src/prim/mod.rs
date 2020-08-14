@@ -9,6 +9,7 @@ strings and more.
 pub use read::Cursor as ReadCursor;
 pub use write::Cursor as WriteCursor;
 
+mod map;
 mod read;
 mod skip;
 mod varint;

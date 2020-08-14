@@ -19,21 +19,21 @@ use crate::prim::varint;
 ///
 /// If necessary, callers can move the cursor backwards to a previous position.
 #[derive(Clone, Debug)]
-pub struct Cursor<'a> {
-    bytes: &'a [u8],
+pub struct Cursor<B> {
+    bytes: B,
     pos: Cell<usize>,
 }
 
-impl<'a> Cursor<'a> {
+impl<B: AsRef<[u8]>> Cursor<B> {
     /// Create a new cursor for a byte slice.
-    pub fn new(bytes: &'a [u8]) -> Cursor<'a> {
+    pub fn new(bytes: B) -> Cursor<B> {
         Cursor { bytes, pos: Cell::new(0) }
     }
 
     /// Return the remaining bytes in this cursor. That is, all bytes in this
     /// cursor starting from the cursor's current position.
-    pub fn as_slice(&self) -> &'a [u8] {
-        &self.bytes[self.pos()..]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes.as_ref()[self.pos()..]
     }
 
     /// Returns the number of bytes remaining in this cursor.
@@ -60,12 +60,8 @@ impl<'a> Cursor<'a> {
     /// This returns an error if the given position is out of bounds. It will
     /// never panic.
     pub fn set_pos(&self, pos: usize) -> Result<(), FormatError> {
-        if pos > self.bytes.len() {
-            bail_format!(
-                "expected pos <= {}, but got {}",
-                self.bytes.len(),
-                pos
-            );
+        if pos > self.bytes.as_ref().len() {
+            bail_format!("expected pos <= {}, but got {}", self.len(), pos);
         }
         self.pos.set(pos);
         Ok(())
@@ -77,7 +73,7 @@ impl<'a> Cursor<'a> {
     /// This returns an error if the given position is out of bounds. It will
     /// never panic.
     pub fn set_pos_rev(&self, rpos: usize) -> Result<(), FormatError> {
-        let len = self.bytes.len();
+        let len = self.bytes.as_ref().len();
         match len.checked_sub(rpos) {
             Some(pos) => self.set_pos(pos),
             None => bail_format!("expected rpos <= {}, but got {}", len, rpos),
@@ -107,7 +103,10 @@ impl<'a> Cursor<'a> {
     /// To consume a range of bytes, use `read_range`.
     ///
     /// If the given range is not valid, then this returns an error.
-    pub fn range(&self, r: Range<usize>) -> Result<Cursor<'a>, FormatError> {
+    pub fn range(
+        &self,
+        r: Range<usize>,
+    ) -> Result<Cursor<&[u8]>, FormatError> {
         if self.as_slice().get(r.clone()).is_none() {
             bail_format!("invalid cursor range {:?}", r);
         }
@@ -123,7 +122,7 @@ impl<'a> Cursor<'a> {
     pub fn read_range(
         &self,
         r: Range<usize>,
-    ) -> Result<Cursor<'a>, FormatError> {
+    ) -> Result<Cursor<&[u8]>, FormatError> {
         let cursor = self.range(r)?;
         self.inc(cursor.len())?;
         Ok(cursor)
@@ -134,10 +133,7 @@ impl<'a> Cursor<'a> {
     ///
     /// (This is like `read_range`, except it returns raw bytes instead of
     /// another cursor.)
-    pub fn read_slice(
-        &self,
-        r: Range<usize>,
-    ) -> Result<&'a [u8], FormatError> {
+    pub fn read_slice(&self, r: Range<usize>) -> Result<&[u8], FormatError> {
         let bytes = match self.as_slice().get(r.clone()) {
             None => bail_format!("invalid slice range {:?}", r),
             Some(bytes) => bytes,
@@ -197,21 +193,21 @@ impl<'a> Cursor<'a> {
 
     /// Read a length prefixed byte string. The length prefix should be a
     /// varint.
-    pub fn read_prefixed_bytes(&self) -> Result<&'a [u8], FormatError> {
+    pub fn read_prefixed_bytes(&self) -> Result<&[u8], FormatError> {
         let len = self.read_varusize()?;
         self.read_slice(0..len)
     }
 
     /// Read a length prefixed UTF-8 encoded string, where the length prefix is
     /// a varint. This returns an error if the bytes are invalid UTF-8.
-    pub fn read_prefixed_str(&self) -> Result<&'a str, FormatError> {
+    pub fn read_prefixed_str(&self) -> Result<&str, FormatError> {
         let bytes = self.read_prefixed_bytes()?;
         std::str::from_utf8(bytes)
             .context("invalid UTF-8 in fixed length string")
     }
 
     /// Interpret the remaining bytes in this cursor as an FST and return it.
-    pub fn read_fst(&self) -> Result<Fst<&'a [u8]>, FormatError> {
+    pub fn read_fst(&self) -> Result<Fst<&[u8]>, FormatError> {
         let fst = Fst::new(self.as_slice()).context("could not read FST")?;
         self.inc(self.as_slice().len())?;
         Ok(fst)
