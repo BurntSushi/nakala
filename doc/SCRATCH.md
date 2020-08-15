@@ -234,6 +234,9 @@ is to use a method called tombstoning. This basically involves two steps:
    merged. (That is, a merged segment will always start with zero deleted
    documents.)
 
+(N.B. There is a little more to this, as deletes will need to make their way
+through the transaction log first. See below.)
+
 For the most part, (2) is fairly simple to accommodate. When two or more
 segments are merged, we simply omit writing doc IDs to the postings that have
 been marked as deleted in its corresponding segment.
@@ -244,7 +247,7 @@ Nakala, it follows that the only reasonable way for a caller to delete a
 document is to delete it by its user ID. (We could in theory provide handles to
 a specific doc ID in a specific segment as part of search results, but omitting
 a way to delete a document by its user ID seems like a critical failing.) This
-means we need a way to quickly map a user ID to every doc ID its associated
+means we need a way to quickly map a user ID to every doc ID it's associated
 with in every segment. This is where the FST mapping user IDs to doc IDs
 described in the section on identifiers comes in handy.
 
@@ -256,9 +259,9 @@ The only other problem remaining is how to handle the fact that deletes are one
 of the few "mutable" aspects of Nakala index. (With the other being the current
 list of active segments.) Since Nakala wants to permit multiple processes (or
 threads) to index new documents at the same time, this implies that deleting
-documents require some kind of inter-process synchronization. We will use the
-same techniques here that we use to synchronize the addition of segments to the
-index.
+documents require some kind of inter-process synchronization. To achieve this,
+we'll use a combination of a transaction log to initially record the deletes
+and file locking to eventually write tombstones to the corresponding segment.
 
 ## Transaction log and synchronization
 
@@ -267,7 +270,8 @@ run against every segment, and results must be merged. Over time, as the
 number of segments increases, they are merged together into bigger segments.
 This architecture makes it possible to use limited memory to create small
 segments at first, and gradually scale by merging segments at search latencies
-start to slow down due to the number of segments.
+start to slow down due to the number of segments. (Where merging an arbitrary
+number of segments takes *close* to constant heap memory.)
 
 One thing required by this architecture is the ability to know which segments
 are active at any given point in time. Namely, segments that have been merged
@@ -281,14 +285,17 @@ multiple writers is quite important, since the vast majority of the work of
 indexing new documents can be performed in parallel by simply creating distinct
 segments.
 
-The primary way in which we approach this problem is through a transaction log.
-The transaction log is the single point of truth about which segments are live
-at any particular point in time. The transaction log has only a few primitives.
-Each primitive includes a timestamp.
+The primary way in which we approach this problem is through a transaction
+log. The transaction log is the single point of truth about which segments are
+live at any particular point in time. Each entry includes a timestamp from
+the system and each entry has a unique transaction ID. There can only ever
+be one reader or writer accessing the transaction log at any point in time.
+To minimize contention, we ensure that all such actions are quick, and in
+particular, do not require that every search first consult the transaction log.
 
 * AddSegment(segmentID) - This indicates that a segment with the given ID has
   been added to the index. The segment ID can be used to derive the location of
-  the segment in storage. Adding a new segment to the log faisl if there
+  the segment in storage. Adding a new segment to the log fails if there
   already exists a live segment with the given ID.
 * StartMerge(segmentID...) - This indicates that one or more segments have
   begun the process of being merged. The purpose of this log is to instruct
@@ -305,34 +312,44 @@ Each primitive includes a timestamp.
   there is no corresponding StartMerge log, or if the new segment ID already
   exists, or if any of the old segment IDs are no longer active or if a
   CancelMerge operation took place.
-* Checkpoint(...) - Records the current set of active segments along with any
-  outstanding StartMerge logs with no corresponding EndMerge logs. The purpose
-  of a checkpoint is that one does not need to read any previous logs to
-  determine the active set of segments.
+* DeleteDocuments(segmentDocID...) - This indicates that one or more documents
+  have been deleted from the index by recording a document's internal unique
+  ID. (Which corresponds to the pair of segment ID and doc ID.) Searches must
+  remove documents recorded in this log entry.
 
-From this log, it should be clear how to compute the active set of segments at
-any particular time. Since adding a new entry to this log should generally be
-quite cheap, and to keep things simple, we require that there can only be one
-writer to the log at any particular time. Each write will check that the new
-log is valid to add and will fail if not, based on the state of the log at the
-time of the write. We can enforce a single writer via file locking (described
-in its own section below).
+From this log, it should be clear how to compute the active set of segments
+at any particular time. Since adding a new entry to this log should generally
+be quite cheap, and to keep things simple, we require that there can only be
+one writer to the log at any particular time. Each write will check that the
+new log entry is valid to add and will fail if not, based on the state of the
+log at the time of the write. We can enforce a single writer via file locking
+(described in its own section below).
 
 There are a few remaining hiccups here.
 
 Firstly, when a StartMerge is added to the log, we have no guarantee that a
 corresponding CancelMerge or EndMerge will be added. The merge process might
-die unexpectedly for example. The only real choice here as far as I can see
-is to cause an implicit CancelMerge to appear in the log if it or an EndMerge
-isn't committed within N time of the StartMerge. At that point, the segments
-will become available for merging again. If the merge just took longer than the
-timeout, then the resulting EndMerge log would fail to add because of the
-previously committed CancelMerge log. This is of course a bit wasteful, but it
-keeps the index coherent. In terms of waste, we should just try hard to avoid
-getting into scenarios where we don't commit an EndMerge in time. (In theory,
-we could introduce a ProgressMerge primtiive that indicates the merge is still
-running, which could reset the StartMerge timeout, but we should try to get by
-without that extra complexity.)
+die unexpectedly for example. There are only two ways that I can see to solve
+this.
+
+1. One is to impose a timeout of sorts, where if a StartMerge hasn't completed
+   within a designated interval, then a CancelMerge log entry is added to the
+   log (or perhaps, equivalently, the StartMerge entry is simply removed).
+   The main downside of a timeout is that if it's too short, we'll wind up
+   doing a lot of work that winds up being wasted. And if the timeout is too
+   long, then it could potentially cause merging to be delayed if a process
+   dies unexpectedly. It's probably better to use a timeout that is too long,
+   since in theory, a process dying unexpectedly should be a somewhat rare
+   event.
+2. When a StartMerge log entry is added, we use that log entry's ID to create a
+   new file and then acquire an OS-native advisory lock on that file. When the
+   merge process is done, it can unlock and remove the file. If the merge
+   process dies unexpectedly, then the OS will automatically unlock the file.
+   At that point, checking whether a merge has been cancelled or not can be
+   determined by trying to acquire a lock on the file created. If the lock
+   cannot be acquired, then at least we know that the process responsible for
+   the merge is still running. It's plausible that we may still want to combine
+   this with some kind of timeout though, in case the process itself is hung.
 
 One remaining hiccup here is to figure out when it's okay to actually delete
 old segments from storage. The only way to do this is to know whether there are
@@ -348,5 +365,310 @@ require a reader to write something to storage so that it can be seen by other
 processes. Secondly, if a reader is required to mark its position in the log,
 then it must also be required to unmark itself, which of course means that'll
 need to introduce another timeout dance like we did for merges above in the
-transaction log. (Since we cannot depend on a reader unmarking itself. It might
-be ungracefully killed without the chance to unmark itself.)
+transaction log, or alternatively use the OS-native advisory lock technique.
+(Since we cannot depend on a reader unmarking itself. It might be ungracefully
+killed without the chance to unmark itself.)
+
+The next section will discuss file locking, which is how we'll implement the
+above procedure in a way that is safe for multiple simultaneous readers and
+writers.
+
+## File locking and index structure
+
+It turns out that file locking is a total and complete pit of despair. There's
+a lot of good material out there bemoaning how awful it is, but I found this to
+be a good high level summary: https://gavv.github.io/articles/file-locks/
+
+### Prelude
+
+I'd like to quickly summarize the options available to us:
+
+* Windows - It has its own locks via `LockFile` and they are non-advisory. But
+  this is OK for the purposes of Nakala. The main thing is that they appear
+  to work, support byte range locking, enjoy broad support and the OS will
+  unlock them if the process holding the lock dies (which is critical for our
+  strategy of dealing with ungracefully killed processes). On Windows at least,
+  this seems like our tool of choice.
+* POSIX fcntl locks - Broken beyond belief, but generally enjoy broad support.
+  They do support byte range locking, but the main way in which they are broken
+  is that they are only process scoped. So if we have multiple Nakala index
+  handles in the same process but in different threads, then we can't use POSIX
+  locks to synchronize between them. (SQLite manages to pull this off by using
+  truly global state and managing a reference count itself. But I don't think
+  it's worth digging into that rabbit hole.)
+* BSD flock - This also appears to enjoy broad support, but doesn't support
+  byte range locking. It does have shared/exclusive locking support though and
+  may be used for synchronization between threads of the same process.
+  Unfortunately, it does not appear to work correctly over NFS. Namely, it
+  gets emulated via POSIX fcntl locks, which means they aren't appropriate for
+  synchronization between threads in the same process. Using flock almost seems
+  like a fool's errand, because you get easily lulled into a false sense of
+  security only to get tripped up big time when using NFS.
+* Linux open file description locks - Available on Linux only, support byte
+  ranges, can be used to synchronize across threads and is claimed to work on
+  NFS. This is the dream scenario, but it's Linux only.
+* Create new file/directory locks - This is the old school "create a lock file"
+  approach that is supposed to work everywhere. Although, it seems NFS (perhaps
+  only older versions) have problems with the `O_EXCL` technique, which might
+  make `mkdir` our best option. (`mkdir` is what SQLite uses.) The
+  downside with this style of locking is that it either requires a timeout or
+  being okay with manual user intervention to remove a lock file if a Nakala
+  process dies unexpectedly. The other downside is that it can only be used for
+  exclusive locking and of course has no byte range locking support.
+
+My reaction to learning all of this was to think _really_ hard about what would
+be the most minimal set of assumptions one could make in order to make Nakala
+work well and fast. That is, the less we assume about the correctness and
+availability of file locking, the simpler the implementation. I'm not sure if I
+succeeded at that, but I did my best.
+
+So, do we _really_ need locking? Yes, I think we do. A design goal of
+Nakala that I am absolutely unwavering on is that it should _just work_ with
+multiple simultaneous readers and writers from multiple processes or threads.
+Having that freedom is intoxicating. It's like writing Rust code. You know the
+compiler will generally prevent you from making the worst kinds of mistakes,
+so you actually wind up feeling liberated. If we had no locking at all, then
+it's possible we might be able to support one writer and many readers and we'd
+have to tell the user that they are responsible for ensuring there is only one
+writer. Which is annoying. We could add a tiny amount of locking for enforcing
+the single writer rule, which would make this better. But a single writer means
+1) you can't use multiple processes to index data, 2) you need to be a bit more
+careful and 3) the Nakala API probably needs distinct `Writer` and `Reader`
+types. (N.B. "single" writer in this context means that while a writer is open
+in memory in one process, no other process can open a writer. If we did use
+the simplistic locking scheme for this, it would correspond to very coarsely
+grained locking.)
+
+OK, so maybe we really do need locking, but could we get by with just old
+school `O_EXCL` file locks? I actually think we could, but there are two major
+problems with this approach as I see it:
+
+1. This approach would necessite either timeouts to deal with locks that were
+   not cleaned up by their creator, or otherwise require users to manually
+   remove rogue lock files. (Most likely, we would make timeouts an optional
+   feature.) Namely, with OS-native advisory locks, the locks are automatically
+   unlocked if the process dies (or the corresponding file descriptor is closed
+   for any reason).
+2. They are really only good for exclusive locks. Which means we can't do
+   something like, "lock these specific bytes in this segment tombstone file,"
+   which would permit multiple processes to delete documents from the same
+   segment simultaneously.
+
+At this point in time, it's hard to say with much certaintly how important (2)
+is, but my instinct is that we really should reduce contention as much as
+possible. (1) feels a bit more important, and in particular, advisory locks
+feel like a pretty elegant solution to the problem of detecting when a reader
+is inactive or when a merge has completed. And in particular, the alternative
+to (1) is pretty grisly: timeouts and/or manual intervention if a process dies
+at the wrong time.
+
+OK, so maybe old school file locks aren't a great idea, but could we at least
+pick _one_ method of file locking and use that? Unfortunately, I don't think
+so. But answering that is trickier, so I think it would make sense to walk
+through the individual use cases for file locking. To do that, I want to
+describe my vision for Nakala's index structure in storage.
+
+### Index structure
+
+While Nakala is designed to be embeddable and therefore doesn't technically
+require a file system to operate, its primary storage engine will of course be
+one that works in a typical directory hierarchy on a file system. To that end,
+we'll assume that particular implementation to discuss index structure, but
+keep in mind that all of this is (hopefully) abstracted from Nakala's point of
+view. Due to how complicated file locking is, it is necessary to think deeply
+about that specific implementation, design the abstraction around that and hope
+that it's sufficient for other use cases. (And if it isn't, we can evolve.)
+
+OK, so here's what I'm thinking the index structure will look like. A Nakala
+index will be a single directory with the following tree. Names in braces
+indicate variables. Files that are transient or are otherwise only intended for
+use in synchronization are in brackets. File names that end with a `?` imply
+that they are only used on some platforms/environments.
+
+  {index-name}/
+    transaction.log
+    [transaction.log.lock]? (non-Linux/Windows)
+    segment.{segmentID}.idx
+    segment.{segmentID}.tomb
+    [segment.{segmentID}.tomb.lock]? (non-Linux/Windows)
+    merges/
+      {transactionID}.active
+    handles/
+      {handleID}.active
+
+Sadly, my hope to use the simplest possible file locking scheme kind of failed,
+because the above structure requires the use of four different lock APIs.
+Although, only two of them are used for any particular platform at a given
+time:
+
+* On Linux, its open file description locks are used in all cases. Explicit
+  lock files are never needed.
+* On Windows, its native `LockFileEx` APIs are used. As with Linux, explicit
+  lock files are never needed.
+* On all other platforms (including macOS), the old school `O_EXCL` lock file
+  approach is used for `transaction.log.lock` and
+  `segment.{segmentID}.tomb.lock`, while POSIX `fcntl` locks are used for
+  merges/{transactionID}.log` and `handles/{handleID.log}`.
+
+The last bullet point deserves a bit more explanation. POSIX locks are okay in
+this case since only a single thread will ever hold locks on these files at
+any given point in time, so we never need to support synchronization between
+threads. In fact, the locks held on the merge and handle logs are specifically
+only to indicate when the ongoing work represented by those logs is complete.
+(Which occurs when the lock is released, whether gracefully or not.) Finally,
+the use of old school lock files for the transaction log and for tombstones is
+unfortunate, since it will limit concurrency to exactly one handle at any given
+point in time. This is bad but perhaps not as bad as it sounds: the critical
+section of each lock should be very small.
+
+We'll go through the reasons for using old school lock files on
+non-Linux/Windows by explaining why the other techniques don't work:
+
+* POSIX fcntl locks don't work (for the transaction log or the tombstones)
+  because they only permit process-to-process synchronization. But we want
+  to be able to have multiple (possibly completely independent) handles in a
+  process running simultaneously. Those handles need to synchronize somehow,
+  and using the file system is the ideal way because we already need such
+  a mechanism in place for process level synchronization. It is in theory
+  possible to use POSIX locks here---after all, SQLite uses them---but it would
+  require sharing global state that manages these locks across all Nakala
+  handles in a given process. It's a big rabbit hole. And that alone doesn't
+  solve the byte range aspect for POSIX locks, which we would want for writing
+  tombstones.
+* BSD flock could potentially be used to fight half the battle. If we were on a
+  local file system in a non-Linux/Windows environment, then flock's
+  shared/exclusive mechanism would come in handy with the transaction log.
+  Because then we could use reader locks any time we just need to read the log.
+  But flock doesn't really help us with synchronizing on the tombstone files
+  since it doesn't support byte-range locking, which we need in order to be
+  able to synchronize writing bits for individual doc IDs. (One alternative
+  here would be to change the tombstone format to use one byte per doc ID
+  rather than one bit, which I think should let us concurrently mutate bytes
+  without synchronization since the file has a fixed size. Or so I think.)
+  Moreover, BSD flock couldn't be used in either scenario when running on
+  NFS since it degrades to POSIX locks and we just explained why those don't
+  work. However, we could at least use flock on non-Linux/Windows and non-NFS
+  environments for the transaction log.
+
+The only other two mechanisms are specific to one platform (Windows and Linux).
+So the only one left is old school lock files. Whether or not we pursue the
+special cases mentioned above should depend on benchmarks motivating the extra
+work. And also use cases. For example, how often are people putting an
+extremely heavy load on a Nakala index on macOS?
+
+
+### Index synchronization
+
+In this section, we'll go over the particulars of synchronization in more
+detail. To make things easier to digest, I'll briefly summarize all areas of
+storage level synchronization required by Nakala:
+
+* The transaction log can only have one writer at any point in time. It may
+  have multiple readers.
+* Writing tombstones to segments requires a write lock on the file, although,
+  it could be done more granularly with a byte range lock if supported. (It
+  isn't clear whether this is beneficial or not, since acquiring a new lock for
+  every byte we write could result in quite a bit of overhead.)
+* Determining whether a merge is complete or not requires synchronizing on the
+  active merge files.
+* Similarly, determining whether a handle has stopped reading the index or not
+  requires synchronizing on the active handle files. We do also require that
+  the `O_EXCL` trick works for creating active handle files, as this is used to
+  guarantee that the ID of the handle is unique.
+* Creating a segment file also requires the `O_EXCL` trick. Like active handle
+  files, we use this to guarantee that we've generated a unique segment ID.
+  Although in the case of segments, we also must check that the segment ID does
+  not appear anywhere in the transaction log to avoid reusing a segment that is
+  in the process of being removed due to compaction.
+* Creating the index itself. Creating the index requires running a `mkdir`
+  command successfully, which will guarantee that it is the only Nakala process
+  writing to files inside of that directory. (If another Nakala process tries
+  to create an index at the same directory at the same time, then they will
+  race and one of them will fail.)
+
+It sounds like there isn't much synchronization and that things should
+therefore be pretty simple! But, it's the interaction between all of these that
+breeds complexity. For example, there is quite a bit of interaction between the
+transaction log and the active merge and handle files. Similarly, there is a
+lot of logic for determining when to actually write tombstones since they are
+first recorded in the log.
+
+For clarity, it's worth pointing out some things that *don't* require
+synchronization:
+
+* Writing to a segment index is only ever done by a single thread. There are
+  never multiple writers to a single segment. Nakala scales as Lucene does:
+  multiple writers write to different segments. Only later are things
+  (optionally) merged together.
+* Reading from a segment index also doesn't require synchronization, as once a
+  segment index has been written, it is never modified again.
+*
+
+The top-most form of synchronization is on the transaction log. What we
+want here is a shared/exclusive lock, where reading acquires a shared lock
+and writing acquires an exclusive lock. In all cases, the critical section
+of one of these locks should be specifically designed to be as quick as
+possible. (Some careful attention is paid to this a bit later for handling log
+compaction.) I think the easiest way to start here is to explain what happens
+when a handle to the index is opened. To be clear, a handle can be used for
+either reading or writing. It can be long lived and cheaply shared between
+threads inside a single process.
+
+When a handle is first opened, it acquires a shared lock on the transaction
+log. This lock should be capable of synchronizing with both other processes and
+with other threads within the same process. (So that rules out POSIX locks.)
+Once a shared lock is obtained, it makes note of the ID of the most recent
+entry in the log. The handle then assigns itself an ID (say, from the current
+timestamp) and attempts to create a new file with `O_EXCL` set with the name
+`{logid}_{handleid}`. If it doesn't succeed, then the handle should generate a
+new ID and try again. If it does, then the handle should acquire an exclusive
+lock on this file. The handle should then read the contents of the transaction
+log into memory (explained in the next paragraph). Once done, the handle can
+drop the shared lock on the transaction log. This technique makes it possible
+to create many readers simultaneously with little to no contention.
+
+Reading the transaction log into memory should result in roughly this
+structure:
+
+    struct Snapshot {
+      // The unique transaction ID corresponding to this snapshot.
+      id: TransactionID,
+      // Handles to segments that are live according to the log.
+      live_segments: Map<SegmentID, Segment>,
+      // IDs of segments that are no longer live but still occur in the log.
+      // This happens after a successful merge and before a log compaction.
+      dead_segments: Set<SegmentID>,
+      // A collection of ongoing segment merges. This information can be used
+      // to smartly choose the next segments that should be merged.
+      merges_in_progress: Map<TransactionID, Set<SegmentID>>,
+      // All deleted document IDs, grouped by segment, that have been recorded
+      // in the log up to this point.
+      deleted_docs: Map<SegmentID, Set<DocID>>,
+    }
+
+This in-memory structure represents a "snapshot" of the index at a particular
+point in time. So long as the handle for this snapshot remains open and is not
+updated to a new snapshot, querying with this snapshot will continue to work
+correctly and should always produce deterministic results.
+
+Other than generating a segment ID, no synchronization is needed when indexing
+new documents until they need to be committed. Namely, writing a new segment
+can only happen within a single thread, and since the segment ID is unique, no
+other process will be writing to it. We can guarantee uniqueness almost via the
+same technique that we used to generate a handle ID, but that would make it
+possible to use an ID of a segment that has been removed but is still recorded
+in the log (e.g., log+index compaction is in progress or log+index compaction
+failed part way through). In particular, a subsequent compaction run after
+a crash might try to delete the old segment even though it had already been
+removed from the file system, which could wind up deleting our new segment.
+We can fix this by checking whether the generated ID for the segment exists
+anywhere in the transaction log. If it doesn't, and since we've already claimed
+the ID in storage (which means it cannot possibly be in a future log entry
+that we haven't seen yet), it follows that even if it did correspond to an old
+segment, it is no longer in the transaction log and therefore won't be tampered
+with.
+
+
+## Durability
+
+https://danluu.com/file-consistency/
