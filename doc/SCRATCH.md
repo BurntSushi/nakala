@@ -10,6 +10,36 @@ had in mind driving this were:
   relevance ranking at all, and requires yielding the complete set of document
   IDs.
 
+## Novelty
+
+Before diving into details, it should be noted that almost no technique
+described in this document is novel. Maybe the _combination_ of these things is
+novel, but it's hard to say. Nakala makes use of Write Ahead Logging,
+copy-on-write and file locking to deal with concurrency. These techniques have
+been used in databases since forever. And in particular, I've taken a lot of
+inspiration from material I've read on Lucene, SQLite and LMDB, as all of those
+things support concurrency in some form.
+
+One thing that I did think was novel was the use of advisory locks to discover
+stale readers (or merges that have been ungracefully killed). But alas, after
+coming up with this idea and looking to see how other embedded databases to
+deal with this, it does indeed seem that LMDB uses this technique. (Although,
+curiously only on Unix and not Windows, even though I believe the technique
+should also work on Windows.)
+
+In general, this sort of information has been extremely difficult to find. In
+doing research, I read lots of code, comments, papers and mailing list posts.
+Frequently, folks would refer to "techniques" that have been used "since
+forever," and yet, I found it difficult to find authoritative sources on them.
+They are almost always buried in platform specific details of how concurrency
+primitives work, or particular interpretations of standards like POSIX, or
+experiments on implementations of said standard or even extrapolations from
+hardware itself. (The author of LMDB has written at length about how writes
+below a certain number of bytes are guaranteed to be atomic at the hardware
+level by HDDs/SSDs for instance, and then proceed to rely on those properties
+in the implementation. How does one actually come across this sort of
+information _and_ be confident enough to rely on it? ¯\_(ツ)_/¯.)
+
 
 ## Things Nakala should NOT do
 
@@ -415,6 +445,14 @@ I'd like to quickly summarize the options available to us:
   being okay with manual user intervention to remove a lock file if a Nakala
   process dies unexpectedly. The other downside is that it can only be used for
   exclusive locking and of course has no byte range locking support.
+
+(N.B. It is plausible that other synchronization primitives could be useful as
+well. For example, shared memory pthread mutexes or shared memory semaphores.
+However, these do not allow us to eliminate file locking in all cases and some
+specific guarantees around what happens to them when their owning process dies
+seem hard to come by. On top of all of that, these shared memory primitives
+seem rarely used in other embedded databases, although I don't know exactly why
+that is.)
 
 My reaction to learning all of this was to think _really_ hard about what would
 be the most minimal set of assumptions one could make in order to make Nakala
