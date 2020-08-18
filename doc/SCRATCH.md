@@ -1017,11 +1017,12 @@ implementation details vary greatly depending on whether they are on-disk
 structures or in-memory structures. (For in-memory structures, Chris Okasaki's
 "Purely Functional Data Structures" is a gem.)
 
-Databases like PostgreSQL, SQLite (in WAL mode) and LMBD (and many more!) all
-do MVCC, although their techniques differ. SQLite is closer to the scheme
-described in this document. LMDB, being quite a bit more specialized, has a
-really nice trick where it reuses blocks of space on disk before writing new
-blocks, and avoids the need for a transaction log altogether.
+Databases like PostgreSQL, SQLite (in WAL mode) and LMBD (and many more!)
+all do MVCC (or MVCC-like in the case of SQLite?), although their techniques
+differ. SQLite is closer to the scheme described in this document. LMDB, being
+quite a bit more specialized, has a really nice trick where it reuses blocks of
+space on disk before writing new blocks, and avoids the need for a transaction
+log altogether.
 
 To complete the motivation, it is critical to note that compaction is a
 critical reason for the complexity of synchronization in Nakala. If Nakala did
