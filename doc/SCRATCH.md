@@ -437,7 +437,7 @@ disk. Conveniently, this also means that we aren't tantilized into shoving this
 mapping into heap memory. We can simply memory map the file and use it directly
 as the doc ID map when writing the merged posting lists.
 
-## Transaction log and synchronization
+## Transaction log
 
 A Nakala index is formed of zero or more segments. Every search request must be
 run against every segment, and results must be merged. Over time, as the
@@ -564,15 +564,15 @@ transaction log, or alternatively use the OS-native advisory lock technique.
 (Since we cannot depend on a reader unmarking itself. It might be ungracefully
 killed without the chance to unmark itself.)
 
-The next section will discuss file locking, which is how we'll implement the
-above procedure in a way that is safe for multiple simultaneous readers and
-writers.
 
 ## File locking and index structure
 
 It turns out that file locking is a total and complete pit of despair. There's
 a lot of good material out there bemoaning how awful it is, but I found this to
 be a good high level summary: https://gavv.github.io/articles/file-locks/
+
+This section mostly serves as a bit of background reading before the next
+section on index synchronization.
 
 ### Prelude
 
@@ -769,10 +769,25 @@ work. And also use cases. For example, how often are people putting an
 extremely heavy load on a Nakala index on macOS?
 
 
-### Index synchronization
+## Index synchronization
 
-In this section, we'll go over the particulars of synchronization in more
-detail. Most of the synchronization isn't too difficult to describe:
+This section discuss how Nakala synchronizes multiple simultaneous readers and
+writers in detail. This is effectively how Nakala provides atomicity and
+isolation, and also partially how consistency is maintained. (Durability is
+discussed later as a separate topic from synchronization.)
+
+We first give a higher level overview of synchronization and then dive into
+log+index compaction to explain it in more depth.
+
+### Synchronization at a glance
+
+In this section, we'll go over more of the particulars of synchronization, but
+we'll remain at a somewhat high level. The next section on log+index compaction
+will drive it home in even more detail, since the existence of compaction is
+the main thing driving the need for synchronization in the first place.
+
+At a low level, most of the synchronization Nakala needs to do isn't too
+difficult to describe:
 
 * The transaction log can only have one writer at any point in time. It may
   have multiple readers.
@@ -860,7 +875,7 @@ This in-memory structure represents a "snapshot" of the index at a particular
 point in time. So long as the handle for this snapshot remains open and is not
 updated to a new snapshot, querying with this snapshot will continue to work
 correctly and should always produce deterministic results, including with
-respect to deleted.
+respect to deleted documents.
 
 Other than generating a segment ID, no synchronization is needed when indexing
 new documents until they need to be committed. Namely, writing a new segment
@@ -879,14 +894,171 @@ that we haven't seen yet), it follows that even if it did correspond to an old
 segment, it is no longer in the transaction log and therefore won't be tampered
 with.
 
-BREADCRUMBS: Touch on active merge and handle files. This should lead into the
-next section about compaction, since compaction needs to know the position of
-the oldest reader in the log. (But also can't compact past a `StartMerge`
-without a corresponding `CancelMerge`/`FinishMerge`.
+At this point, we've covered synchronization on the log at a very high level in
+addition to the synchronization required to produce a segment file (which boils
+down to generated a unique segment ID). We've also mostly addressed index
+creation itself, since `mkdir` will return an error if the index already
+exists. The only synchronization issues remaining to address at a high level is
+how to determine when merges are complete or when Nakala handles have become
+stale.
 
-### Log and index compaction
+Both of these things use the same technique, which we alluded to above in our
+discussion of file locking. Namely, both use a single file in storage to
+indicate that either a merge has started or a Nakala handle has been opened. In
+both cases, a lock is acquired on this file immediately. Once the merge has
+completed or when the Nakala handle is closed, the lock on this file is
+released and the file is removed. Of course, we cannot rely on graceful
+destruction of resources, which is where the file lock comes in handy. If the
+process holding the lock dies without cleaning itself up, the lock will
+automatically be released. This makes it possible for log+index compaction to
+later discover a stale handle or a merge that will never complete.
 
-BREADCRUMBS: This is Nakala's "checkpoint" process.
+Detecting these cases is critical:
+
+* We need to know if a merge will never complete because otherwise Nakala will
+  refuse to allow the segments involved in that merge to participate in another
+  merge. This avoids doing redundant work, and of course, allowing a segment to
+  get merged into two other segments simultaneously would violate the integrity
+  of the index. If we can determine that a merge has been stopped, then we can
+  record this and free up the participating segments correctly without any
+  wasted work. The only other alternative to this would be some form of timeout
+  mechanism, which would permit us to preserve correctness, but might
+  occasionally result in wasted work.
+* Similarly, it is critical to be able to reliably know the _oldest_ active
+  Nakala handle. This knowledge is what permits us to perform log+index
+  compaction, since if we know that the oldest Nakala handle is not reading a
+  segment that has since been merged into another segment, then we therefore
+  know that no future Nakala handle will ever read that segment. Thus, the
+  segment can be removed and the corresponding entry in the transaction log can
+  be removed. If we couldn't reliably detect the oldest _active_ Nakala handle,
+  then it would prevent us from compacting the index. As with merges, the only
+  alternative to using locking is some kind of timeout mechanism, which would
+  let us guarantee correctness, but at the expense of being either delayed in
+  detecting stale handles, or worse, deleting segments that a handle is still
+  trying to read from and is otherwise simply taking a long time.
+
+There are of course still some failure modes here. For example, a caller might
+keep a handle open for a long time (think about a network process) which will
+prevent compaction. There isn't too much to be done about this, although it
+seems likely that we'll want some kind of auto-update mechanism where the
+handle updates itself to the latest transaction log entry. (Whether that's
+based on time or on every action, I'm not sure.) Either way, this failure mode
+isn't specific the locking strategy described above. It could happen with the
+timeout strategy too. The difference is that the timeout strategy is even more
+error prone. Avoiding the error proneness of the timeout strategy is especially
+important for Nakala handles in an embedded database, since I anticipate that a
+common access pattern will be something like:
+
+* Start process.
+* Open Nakala index.
+* Get handle.
+* Run search.
+* Print results.
+* Exit process.
+
+In most runs, exiting the process should hopefully include closing the handle.
+At minimum, we can do this inside a Rust destructor proactive, so the caller
+doesn't even need to be counted on to do it. But, destructors aren't guaranteed
+to run. The caller might call `process::exit(0)` for example. Or perhaps the
+user will `^C` the process, and the caller might not have a signal handler
+installed to properly clean up resources. Or any number of other scenarios. I
+expect this sort of thing to happen a lot, so having a reliable means of
+detecting this sort of case makes things a lot nicer. With a timeout mechanism,
+all of these cases would necessarily devolve to "compaction must wait N minutes
+until it is sure that the handle is stale, and then can compact past it." With
+the locking strategy, staleness can be detected instantly.
+
+That about sums up Nakala's need for synchronization at a reasonably high
+level. The next section will discuss compaction, which is really at the core of
+why Nakala needs synchronization at all.
+
+### Motivating compaction
+
+Compaction refers to the process of reducing the size of the transaction log,
+reducing number of segments in storage, and, to a lesser extent, removing the
+oldDocID -> newDocID map present in merged segments. The fundamental way in
+which compaction works is pretty much how any other kind of garbage collection
+works: it detects what is no longer being used and removes it. The main
+problems in this process come from 1) reliably and correctly detecting that
+something is no longer used and 2) synchronizing its removal.
+
+Popping up a level, why do we need compaction? We need compaction because
+otherwise the index would grow without bound. Specifically, due to how segment
+files are written and the nature of inverted indices, it just isn't feasible to
+update them in place. Moreover, even if we could devise such a mutable system
+with similar read latency and storage overhead, we might not want to because of
+the benefits of immutability. Namely, immutability _reduces_ the need for
+synchronization since once a segment index is written, nothing else will _ever_
+write to it. Therefore, no synchronization is ever needed to read from segment
+files, which further implies that writers to an index will never block readers
+to an index. This is a supremely desirable quality that dramatically improves
+the scaling properties of a database.
+
+The downside of immutability is that it takes up lots of space. Since you
+aren't mutating an existing structure when writing a new document, you wind up
+needing to build a whole new structure just to accomodate it. Moreover, if you
+only write one document at a time, instead of batching them, then each such
+document gets its own segment. This is gratuitously wasteful of space, but is
+the price we pay for immutability. Therefore, in order to avoid wasting lots of
+space, compaction allows us to reclaim it. _Additionally_, and just as
+critically, if we grew the number of segments without any compaction, then
+search requests would need to search ever more segments, which will keep
+increasing the latency of search requests. Therefore, compaction is not only
+about saving space, but also about improving search latency!
+
+This technique of using immutability to avoid synchronization costs is
+sometimes called Multi-Version Concurrency Control (MVCC) in the context
+of database design. But the technique itself is really broader than that.
+Another name for it is persistent data structures, which are commonly found in
+functional languages due to their preference for immutability over mutability.
+There is somewhat of an art to building these sorts of data structures because
+you almost always have to balance time and space delicately. Of course, the
+implementation details vary greatly depending on whether they are on-disk
+structures or in-memory structures. (For in-memory structures, Chris Okasaki's
+"Purely Functional Data Structures" is a gem.)
+
+Databases like PostgreSQL, SQLite (in WAL mode) and LMBD (and many more!) all
+do MVCC, although their techniques differ. SQLite is closer to the scheme
+described in this document. LMDB, being quite a bit more specialized, has a
+really nice trick where it reuses blocks of space on disk before writing new
+blocks, and avoids the need for a transaction log altogether.
+
+To complete the motivation, it is critical to note that compaction is a
+critical reason for the complexity of synchronization in Nakala. If Nakala did
+no compaction of its immutable segments, then Nakala could _almost_ get away
+without any synchronization at all. Deleting documents could be done by writing
+tombstones to segments directly (using one byte per docID, which therefore
+wouldn't need synchronization), and new segments could be created via creating
+files with the `O_EXCL` flag, which would guarantee uniqueness. To find all the
+segments in the index at any point in time, Nakala would just need to list the
+index directory contents and pick out the completed segment files. The only
+problem with this approach is that we'd give up isolation with respect to
+deleted documents. (It would permit a "read uncommitted" isolation level.) We
+could get back to a "repeatable read" isolation level by re-introducing a
+transaction log, but with lighter synchronization requirements:
+
+* There would still need to be a shared/exclusive locking mechanism for the
+  transaction log. We would need this to guarantee atomic additions to the
+  file. (In theory, appending a small amount of data to a file is supposed to
+  be atomic on its own, but there are conflicting reports on the Internet as to
+  whether this is truly guaranteed or not.)
+* When documents are deleted, they are recorded in the transaction log as
+  described above. For efficiency, we could periodically write tombstones to
+  segments (using 1 byte per doc ID, so that doesn't require synchronization
+  either) and then record this act in the log. Nakala then wouldn't need to
+  load all deleted doc IDs into memory---it could drop the ones that have been
+  written to storage.
+* We would need to track active Nakala handles, such that we only wrote
+  tombstones for deletions that occur _before_ the oldest active reader.
+  Otherwise, it would be possible to observe a delete mid-way through a
+  transaction, leading to a phantom read.
+
+So, with compaction well motivated, we can move on to describing the actual
+process in more detail.
+
+### Log and index compaction explained
+
+BREADCRUMBS: Walk through the actual algorithm, step-by-step.
 
 
 ## Durability
