@@ -1,7 +1,7 @@
 This is a "scratch" document that was primarily used during initial development
-of Nakala. It keeps track of higher level constraints that I used to drive the
-implementation, along with lots of other bits. The two different use cases I
-had in mind driving this were:
+of Nakala. It keeps track of constraints, architecture, design and nasty
+implementation details that I used while writing the code. The two different
+use cases I had in mind driving everything were:
 
 * To serve as the name index for imdb-rename, which just needs to index short
   name strings. Notably though, multiple names can be indexed for the same ID.
@@ -10,11 +10,15 @@ had in mind driving this were:
   relevance ranking at all, and requires yielding the complete set of document
   IDs.
 
-## Novelty
+Of course, I tried to keep generality in mind as well, as I've used IR systems
+in many other contexts too. And tried to think about how others might use this
+code, but didn't step too far outside my comfort zone.
+
+## Novelty prelude
 
 Before diving into details, it should be noted that almost no technique
 described in this document is novel. Maybe the _combination_ of these things is
-novel, but it's hard to say. Nakala makes use of Write Ahead Logging,
+novel, but it's hard to say. Nakala makes use of write-ahead logging,
 copy-on-write and file locking to deal with concurrency. These techniques have
 been used in databases since forever. And in particular, I've taken a lot of
 inspiration from material I've read on Lucene, SQLite and LMDB, as all of those
@@ -23,9 +27,13 @@ things support concurrency in some form.
 One thing that I did think was novel was the use of advisory locks to discover
 stale readers (or merges that have been ungracefully killed). But alas, after
 coming up with this idea and looking to see how other embedded databases to
-deal with this, it does indeed seem that LMDB uses this technique. (Although,
-curiously only on Unix and not Windows, even though I believe the technique
-should also work on Windows.)
+deal with this, it does indeed seem that LMDB uses this same technique.
+(Although, curiously only on Unix and not Windows, even though I believe the
+technique should also work on Windows.) With that said, I still have never seen
+this technique explicitly discussed. But lots of things never are in this
+field, seemingly. Either it's just not commonly known, or more likely, everyone
+in the field thinks it's "obvious." (If you can't tell, I was greatly miffed by
+a lot of the elitist attitudes I came across in my research.)
 
 In general, this sort of information has been extremely difficult to find. In
 doing research, I read lots of code, comments, papers and mailing list posts.
@@ -36,35 +44,37 @@ primitives work, or particular interpretations of standards like POSIX, or
 experiments on implementations of said standard or even extrapolations from
 hardware itself. (The author of LMDB has written at length about how writes
 below a certain number of bytes are guaranteed to be atomic at the hardware
-level by HDDs/SSDs for instance, and then proceed to rely on those properties
-in the implementation. How does one actually come across this sort of
-information _and_ be confident enough to rely on it? ¯\_(ツ)_/¯.)
+level by HDDs/SSDs for instance, and then proceeds to rely on those properties
+in the implementation of LMDB. How does one actually come across this sort of
+information _and_ be confident enough to rely on it? `¯\_(ツ)_/¯`.)
 
 
 ## Things Nakala should NOT do
 
-This is no easy task. We really want to try to strike a balance between being
-simple enough that Nakala is flexible and embeddable in other applications, but
-heavy enough that it actually handles most of the complexity in many common use
-cases. Striking this balance in an IR engine is hard. Still, there are some
-things we can rule out fairly easily:
+We really want to try to strike a balance between being simple enough that
+Nakala is flexible and embeddable in other applications, but heavy enough that
+it actually handles most of the complexity in many common use cases. Striking
+this balance in an IR engine is hard. Still, there are some things we can rule
+out fairly easily:
 
 * Nakala will not handle tokenization beyond simplistic approaches. Nakala
   might provide some standard whitespace or ngram tokenizers, but it is
   otherwise up to the caller to plug in more sophisticated things like language
   aware stemmers or lemmatizers.
-* Nakalas query infrastructure should generally be limited to boolean term
+* Nakala's query infrastructure should generally be limited to boolean term
   queries.
 * Nakala will not have a notion of "fields" or any such thing. Every document
   is just a multi-set of terms. In this sense, there is no schema as there is
-  only one field for every document.
+  only one field for every document. (Technically, Nakala does associated a
+  user supplied identifier with each document, and this is represented as its
+  own field in a specialized way.)
 * Similar to the above, Nakala will strictly be an index. It will not store
-  document context.
+  document content.
 * The only things in the index will be document frequencies. Positions will not
   be indexed. This means phrase queries will not be possible... For that
   reason, I strongly suspect this constraint may be relaxed in a future
   version, but we leave it out of the initial version. (Because phrase queries
-  are supremely useful.)
+  are supremely useful, but increase the complexity of the implementation.)
 
 These alone draw a fairly bright dividing line between Nakala and more full
 fledged IR systems like Lucene. Nakala is built for simpler tasks, and we
@@ -94,17 +104,43 @@ that it should do?
   matched. (This is useful for imdb-rename's name index where many films have
   aliases.)
 * Nakala should have a pluggable "file system abstraction," such that it can
-  have its index read or written to from anywhere. That is, it shouldn't tied
-  to an actual file system. With that said, the typical way to read a Nakala
-  index will be through memory maps. It's not clear how useful this abstraction
-  will be though, since it will probably operate at the segment level and
-  segments can get quite large.
+  have its index read or written to from anywhere. That is, it shouldn't be
+  tied to an actual file system. With that said, the typical way to read a
+  Nakala index will be through memory maps. It's not clear how useful this
+  abstraction will be though, since it will probably operate at the segment
+  level and segments can get quite large. (In reviewing this document, it is
+  awfully tempting to forgo this abstraction layer initially, since designing
+  it seems like a lot of work _and_ it's insidiously complicated.)
 * Nakala should provide a way to search the index not only without relevance
   ranking, but without the overhead of relevance ranking. This should likely
   be both an index time and a query time setting. That is, it should be
   possible to build an index without document frequencies and it should be
   possible to search an index with document frequencies but without relevance
   ranking.
+
+The other major design point that Nakala could have occupied---and I did
+carefully consider---is a library for writing a single segment. This is
+tempting because this design space only requires focusing on the IR bits and
+the file format, and _not_ on anything concurrency related. Why? Because only
+one thread can feasibly write to a segment, and once it's written, it can never
+be mutated due to its representation. So at that point, any number of threads
+or processes can read from it without synchronization.
+
+While it's plausible I may build such a standalone library, it's likely to end
+up as `nakala-core`, where `nakala` itself handles everything else. The problem
+with only offering that is that it isn't broadly useful. It really only applies
+to some specific niches (imdb-rename being one of them), and in order to get
+it to work in a more scalable fashion, you really need to wind up building a
+lot of the infrastructure that `nakala` could have done for you. Finally, on
+top of all of that, ripgrep's use case absolutely requires building out that
+infrastructure, so I must do it anyway. We might as well package it up and
+make it generally useful.
+
+Plus, ever since I started learning about information retrieval ~six years ago,
+I've always wanted to build an IR system. But I wanted to do something
+different than what Lucene has done. Nakala isn't _that_ different than Lucene,
+but I think it will occupy enough of a niche for it to be successful. Time will
+tell.
 
 ## Handling identifiers
 
@@ -117,12 +153,15 @@ two different identifiers in play:
    ID is the Unit of Retrieval when executing a search and is therefore the
    primary way in which a search result can be tied back to the actual thing
    that has been indexed.
-2. Internal identifiers called "doc IDs." A doc ID is unique only within a
-   particular segment. Doc IDs are controlled and allocated by Nakala in order
-   to retain certain properties, such as being a dense sequence of
-   monotonically increasing integers. Doc IDs are u32 identifiers that make up
-   the posting lists for each term (in addition to term frequencies).
+2. Internal document identifiers called "doc IDs." A doc ID is unique only
+   within a particular segment. Doc IDs are controlled and allocated by Nakala
+   in order to retain certain properties, such as being a dense sequence of
+   monotonically increasing integers. Doc IDs are u32 identifiers that make
+   up the posting lists for each term (in addition to term frequencies).
    Therefore, each segment can index a maximum of 2^32 separate documents.
+
+(Nakala will have other identifiers in play as well, such as transaction IDs
+and segment IDs, but these are a bit more mundane.)
 
 When a user indexes a document, they must provide at least two things: a user
 ID for the document and a sequence of terms to index. Since doc IDs make up the
@@ -132,7 +171,11 @@ have a mapping from a doc ID to its corresponding user ID.
 Moreover, since Nakala will support deleting documents, the only sensible way
 to implement deletes is by requiring the caller to provide the user ID of the
 document they want to delete. Therefore, there must be some way of mapping a
-user ID to its corresponding doc ID.
+user ID to its corresponding doc ID. (Not quite the _only_ sensible way.
+Another approach would be to permit callers to delete a document corresponding
+to a search, but this is quite restrictive and provides no easy foreign key to
+delete a document. However, we can (easily) provide this in addition to deletes
+by user ID.)
 
 Orthogonally, we also must decide how to deal with (or enforce) the uniqueness
 of user IDs. We have a few choices:
@@ -146,11 +189,13 @@ of user IDs. We have a few choices:
 
 (1) is quite difficult to do, since it requires doing some kind of index wide
 lookup for every ID of every document that is indexed. Other than this being
-costly in and of itself, it will also need to a synchronized check of some kind
+costly in and of itself, it will also need to be a synchronized check of some kind
 to prevent races from sneaking in a duplicate ID. This in turn would make the
 check even more expensive. Without this requirement, indexing documents in each
 segment is a completely independent process that only needs to be synchronized
-once a segment is ready to join the index.
+once a segment is ready to join the index. _With_ this requirement, we
+completely thwart our ability to permit callers to use multiple writers at once
+without blocking each other for the vast majority of the writing process.
 
 (2) seems feasible on its face, if not a cheap cop-out. However, if we assume
 that user IDs are unique and design our index format around that, then we would
@@ -160,24 +205,40 @@ merge would either need to fail or drop one of the duplicate documents. The
 former essentially makes the index broken since any two segments should be
 mergeable. The latter is undesirable since it silently drops data.
 
-(3) is really the only good choice IMO. Moreover, it's actually useful. For
-example, in the case of imdb-rename, it's quite handy to be able to index
-multiple names under the same identifier since many movies and TV shows have
-aliases. Being able to search all of those aliases as if they were one document
-and having them deduplicated at search time in favor of the "best" match is
-_exactly_ what you want.
+(3) is really the only good choice IMO if we want to permit truly concurrent
+writers. Moreover, it's actually useful. For example, in the case of
+imdb-rename, it's quite handy to be able to index multiple names under the same
+identifier since many movies and TV shows have aliases. Being able to search
+all of those aliases as if they were one document and having them deduplicated
+at search time in favor of the "best" match is _exactly_ what you want.
+
+One could argue that (3) is somewhat of a cop-out, because if you do care about
+uniqueness, it generally puts the onus on the caller to manage that themselves.
+Otherwise, the caller could end up _accidentally_ indexing duplicate documents
+when what they really wanted was a constraint violation telling them that the
+ID already exists. Other than the considerable benefits of this approach
+mentioned above, one final justification is that Nakala is very deliberately
+not a document store. The _only_ thing it can do is return an ID. This ID, in
+many cases, is almost always going to be associated with something else in some
+other system of record. And _that_ system of record can manage uniqueness.
 
 We now need to design an index format that supports this functionality without
 violating any of our constraints. We will use two different per-segment
 structures to deal with this:
 
-* An FST that maps each user ID to a range of doc IDs. Every doc ID in the
-  range corresponds to a document that has been indexed for that user ID.
+* An FST that maps each user ID to an inclusive range of doc IDs. Every doc ID
+  in the range corresponds to a document that has been indexed for that user
+  ID.
 * A map from doc ID to a range of doc IDs that are equivalent. This is
   structured as a single contiguous block of `N * u64LEs`, where `N` is the
   total number of documents in a segment. Each doc ID corresponds to an offset
   into this map. The value for each doc ID corresponds precisely to a range in
   the FST above.
+
+(N.B. In the case where a segment does not have any duplicates, we can omit the
+second map entirely since every range is just the doc ID repeated in the upper
+and lower 32 bits of the u64LE. This is easy to detect because of the state we
+buffer while writing before actually writing the segment. See below.)
 
 The "trick" to this scheme is that regardless of the order in which documents
 are indexed, doc IDs are assigned to user IDs in a monotonically increasing
@@ -186,15 +247,23 @@ order. We do this by:
 * When a new document is indexed, we generate a temporary doc ID and assign it
   to the user ID given for that document. We record this mapping and permit
   multiple temporary doc IDs to be assigned to a single user ID.
-* Once it comes time to create the segment, we sort the user IDs in
+* Once it comes time to create the segment in storage, we sort the user IDs in
   lexicographic order.
 * Iterate over the user IDs in lexicographic order. For each user ID, iterate
   over each temporary doc ID. For each temporary doc ID, generate a
-  monotonically increasing real doc ID and associated it with the user ID.
+  monotonically increasing real doc ID (using our iteration order) and
+  associated it with the user ID. The resulting mapping is exactly the same
+  size as the `userID->tempDocID` map.
 * Record a mapping from temporary doc ID to real doc ID during the previous
   step.
 * When writing the posting lists, map the temporary doc IDs recorded in the
   postings in memory to their real doc IDs.
+
+(N.B. If every user ID maps to a single temporary doc ID, we still need to do
+the dance above, since we still need doc IDs to be allocated in monotonically
+increasing order with respect to the lexicographic order of user IDs. This is
+what gives us the "superpower" to do `docID->userID` reverse lookups on the
+FST mentioned below.)
 
 This scheme permits us to create monotonically increasing ranges of doc IDs
 that all map to the same user ID. This in turn permits the aforementioned FST
@@ -217,36 +286,6 @@ we're merging. When two or more segments have the same user ID, we simply merge
 their doc ID ranges with a fresh allocation. Since everything is visited in
 lexicographic order, we can preserve the monotonicity of the doc ID ranges.
 And regenerating the map from doc ID to doc ID ranges is also trivial.
-
-## Merging segments
-
-One of the main constraints of segment merging is that it should be able to
-happen with ~constant heap memory. In my mind's eye, this is nearly achievable.
-One of the key things that makes this possible is that multiple FSTs can be
-unioned together in a streaming fashion from the index. This means we can
-seamlessly merge the term index and the userID -> docID FST index described
-above. Moreover, since doc IDs are unique to each segment, we can treat all of
-them as referring to distinct documents and simply allocate new doc IDs as
-needed. When a single user ID is mapped to multiple doc IDs, even if this
-happens in multiple segments, then those duplicates are all contiguous because
-of how we allocated the doc IDs, so those can all be handled in a streaming
-fashion as well. So to can document frequencies, which are stored in a separate
-stream from doc IDs, but in correspondence.
-
-Other than things like headers, footers and miscellaneous attributes, that
-pretty much covers everything except for the skip list generated for the
-posting list for each term. There's really no way that I can see to stream
-these to disk as we need to know all of the skip entries in order to partition
-them into levels. Moreover, to avoid buffering the serialized bytes of skip
-entries, we need to write them in reverse. (Because each skip entry contains a
-pointer to its next sibling.) With that said, each skip extra is a u32 doc ID
-with a usize offset, so it's in practice quite small. Moreover, we only create
-a skip entry for each block of doc IDs and each block can contain many doc IDs.
-So the number of skip entries is quite small. Still, its size _is_ proportional
-to a part of the index size, but to my knowledge, it is the only such thing.
-(We could do away with skip lists since skipping entire blocks is itself quite
-fast, but my guess is that they are too important for speeding up conjunction
-queries to throw them away.)
 
 ## Handling deletes
 
@@ -277,13 +316,23 @@ Nakala, it follows that the only reasonable way for a caller to delete a
 document is to delete it by its user ID. (We could in theory provide handles to
 a specific doc ID in a specific segment as part of search results, but omitting
 a way to delete a document by its user ID seems like a critical failing.) This
-means we need a way to quickly map a user ID to every doc ID it's associated
+means we need a way to quickly map a user ID to every doc ID it is associated
 with in every segment. This is where the FST mapping user IDs to doc IDs
 described in the section on identifiers comes in handy.
 
 Since deletes are recorded by doc ID and since doc IDs are assigned in a
 contiguous and dense fashion, it follows that we can record deletes using a
-bitset. So we only need ceil(N/8) bytes of space to record them.
+bitset. So we only need ceil(N/8) bytes of space to record them. However, this
+does somewhat complicate concurrent processes deleting documents. If each byte
+records the deletion status of 8 documents, then multiple processes must
+synchronize before writing to this file to avoid a race that accidentally
+squashes a document delete. While at this point in time it's not clear how much
+of a performance issue it would be to synchronize in this case, my current plan
+to avoid the synchronization problem entirely by using a full byte to record
+the deletion status for each document. Then, multiple processes can mark
+documents deleted concurrently with zero synchronization. While this does waste
+space, it is very little waste compared the segment itself and other ID
+mappings we already need to store.
 
 The only other problem remaining is how to handle the fact that deletes are one
 of the few "mutable" aspects of Nakala index. (With the other being the current
@@ -293,13 +342,108 @@ documents require some kind of inter-process synchronization. To achieve this,
 we'll use a combination of a transaction log to initially record the deletes
 and file locking to eventually write tombstones to the corresponding segment.
 
+We'll explaining all of the synchronization issues in more detail later, but
+one of the nastiest variants of this is what happens when a document is deleted
+in a segment that has been merged into another segment. If we did nothing, we
+would write the _old_ segment ID of the document into the transaction log, but
+since that segment is no longer active _and_ we have no way of mapping the old
+docID to its corresponding docID in the merged segment, then we would wind up
+losing the delete. Which is bad. We wind up solving this by building another ID
+map when we merge segments, which maps doc IDs in their old segments to the doc
+IDs in the merged segment. This wastes space, but the mapping can be deleted
+once it is known that there are no active handles to any of the old segments.
+
+## Merging segments
+
+One of the main constraints of segment merging is that it should be able to
+happen with ~constant heap memory. In my mind's eye, this is almost achievable,
+but not quite. One of the key things that makes this mostly possible is that
+multiple FSTs can be unioned together in a streaming fashion from the index,
+and then also streamed to disk in a new FST that has all of the keys from the
+union. This means we can seamlessly merge the term index and the userID ->
+docID FST index described above. Moreover, since doc IDs are unique to each
+segment, we can treat all of them as referring to distinct documents and simply
+allocate new doc IDs as needed. When a single user ID is mapped to multiple
+doc IDs, even if this happens in multiple segments, then those duplicates are
+all contiguous because of how we allocated the doc IDs, so those can all be
+handled in a streaming fashion as well. So too can document frequencies, which
+are stored in blocks adjacent to their corresponding doc IDs.
+
+Other than things like headers, footers and miscellaneous attributes, that
+pretty much covers everything except for the skip list generated for the
+posting list for each term. There's really no way that I can see to stream
+these to disk as we need to know all of the skip entries in order to partition
+them into levels. Moreover, to avoid buffering the serialized bytes of skip
+entries, we need to write them in reverse. (Because each skip entry contains a
+pointer to its next sibling.) With that said, each skip entry is a u32 doc ID
+with a usize offset, so it's in practice quite small. Moreover, we only create
+a skip entry for each block of doc IDs and each block can contain many doc IDs.
+So the number of skip entries is quite small. Still, its size _is_ proportional
+to a part of the index size, but to my knowledge, it is the only such thing.
+(We could do away with skip lists since skipping entire blocks is itself quite
+fast, but my guess is that they are too important for speeding up conjunction
+queries to throw them away.)
+
+There is one other critical aspect of merging that is necessary to make ACID
+in Nakala work in the face of concurrency. The ACID part of this is described
+in more detail in the transaction log and synchronization section below, but
+suffice it to say, it is necessary for a merged segment to provide a way to map
+doc IDs from their old segment to their new doc IDs in the merged segment. This
+map must also include deleted document IDs for it to provide quick random
+access lookups from the old ID namespace.
+
+The map can be generated as we merge the userID -> docID FSTs, and it can be
+streamed to disk. The map should have a header indicating the segment IDs that
+have been merged (encoded as a length prefixed block of pairs of u64LEs, where
+the first value in each pair is the segment ID and the second is the file
+offset into the segment block mapping old to new doc IDs). Following that is a
+sequence of blocks whose length is equal to the number of segments. Each block
+contains a contiguous sequence of new doc IDs (as u32LEs), with the offset
+of each being an old doc ID. (If an old doc ID has been deleted, then `0` is
+encoded at that position, which serves as a sentinel value since we don't
+permit a doc ID to be `0`.) Lookups are constant assuming you have a map from
+segment ID to the segment block index in this file, which can be built from the
+header and stored in heap memory very easily. At that point, you just need to
+read the four bytes starting at `segment offset + 4*oldDocID` to get the new
+doc ID (or the `0` sentinel if it has been deleted).
+
+This map can be streamed to disk since we visit old doc IDs in a streaming
+lexicographic fashion. As we allocate new doc IDs, they can be written to this
+map. The main downside of this strategy is that while we visit doc IDs in order
+across all merged segments, we will jump around each segment map in the file.
+So we'll have to write a doc ID in one block, and then the next doc ID will
+likely be written in another block. We could avoid seek time overhead using
+things like `pwrite` (and the equivalent on Windows), but we still wind up
+with a syscall for every doc ID, which is a non-starter. At that point, we can
+either use a mutable memory map or simply create a buffer for each segment
+block and write it out as we go using `pwrite` and such (which permits
+efficiently using a single file descriptor). The mutable memory map would be
+deliciously simple though, since the OS would handle the buffering for us.
+
+This might seem like a lot of trouble to go through, but it's necessary for
+ACID, since otherwise we might lose deletes. This could occur if a merge is
+committed while an old Nakala handle deletes a document from one of the
+segments that got merged. Once that delete gets committed, Nakala has to detect
+that its ID is not in an active segment and instead map it to one that is in an
+active segment. In fact, in theory, the mapping might need to go through
+multiple merges if a Nakala handle has been open for long enough!
+
+On top of all of that, creating this mapping at merge time is necessary
+_anyway_. Namely, we must maintain a map at some point from old doc ID to new
+doc ID, as we will use this to write the new posting list of the merged
+segment. All of the old doc IDs must be mapped to their new doc ID in the
+merged segment. The only thing ACID does is force us to push this mapping to
+disk. Conveniently, this also means that we aren't tantilized into shoving this
+mapping into heap memory. We can simply memory map the file and use it directly
+as the doc ID map when writing the merged posting lists.
+
 ## Transaction log and synchronization
 
 A Nakala index is formed of zero or more segments. Every search request must be
 run against every segment, and results must be merged. Over time, as the
 number of segments increases, they are merged together into bigger segments.
 This architecture makes it possible to use limited memory to create small
-segments at first, and gradually scale by merging segments at search latencies
+segments at first, and gradually scale by merging segments as search latencies
 start to slow down due to the number of segments. (Where merging an arbitrary
 number of segments takes *close* to constant heap memory.)
 
@@ -313,39 +457,60 @@ was still using. And of course, all of this must be robust with respect to
 multiple writers and readers using the index at the same time. Permitting
 multiple writers is quite important, since the vast majority of the work of
 indexing new documents can be performed in parallel by simply creating distinct
-segments.
+segments. (Permitting multiple writers is just as much about figuring out
+concurrency as it is setting policy. For example, Nakala doesn't require that
+every document have a unique user ID. This is critical for permitting multiple
+writers that don't block each other.)
 
 The primary way in which we approach this problem is through a transaction
 log. The transaction log is the single point of truth about which segments are
 live at any particular point in time. Each entry includes a timestamp from
-the system and each entry has a unique transaction ID. There can only ever
-be one reader or writer accessing the transaction log at any point in time.
-To minimize contention, we ensure that all such actions are quick, and in
-particular, do not require that every search first consult the transaction log.
+the system and each entry has a unique transaction ID that is monotonically
+increasing. (N.B. The timestamp is only recorded for debugging/info purposes.
+As of now, Nakala never relies on timestamps for any sort of correctness.)
+Either many readers can be reading the log at the same time, or only one writer
+can. To minimize contention, we ensure that all such actions are quick, and
+in particular, do not require that every search first consult the transaction
+log. (It may sound like we are giving up on our ideal of multiple concurrent
+writers, but as we'll see, the lock time required here is very small and
+mostly just amounts to some small book-keeping. Most of the writer's work is
+done without a lock held on the transaction log and thus does not block other
+writers in other threads _or_ other processes.)
+
+The types of log entries are as follows:
 
 * AddSegment(segmentID) - This indicates that a segment with the given ID has
   been added to the index. The segment ID can be used to derive the location of
   the segment in storage. Adding a new segment to the log fails if there
-  already exists a live segment with the given ID.
+  already exists a live segment with the given ID (or an inactive segment that
+  hasn't been removed from the transaction log yet).
 * StartMerge(segmentID...) - This indicates that one or more segments have
   begun the process of being merged. The purpose of this log is to instruct
   other processes that some set of segments are involved in a merge. This helps
   reduce repetitive work. Adding a StartMerge log fails if it contains a
-  segment ID that is involved in an active merge.
+  segment ID that is involved in an active merge. Because of that failure
+  condition, `StartMerge` also serves as _permission_ to start a merge
+  involving a segment while being sure that it isn't just doing wasted work by
+  racing with some other process.
 * CancelMerge(segmentID...) - This indicates that a prior StartMerge has been
   stopped without finishing. The segment IDs in StartMerge remain active and
-  are now eligible for merging again.
+  are now eligible for merging again. This can be explicitly committed by an
+  in-progress merge that has been cancelled for some reason. (Whether by the
+  caller or a signal handler trying to clean up resources used by the process.)
 * EndMerge(newSegmentID, oldSegmentID...) - This indicates that a merge has
   finished and a new segment has been added to the index. The old segment ID
   list must correspond to a previously recorded StartMerge log, and now point
   to segments that are no longer in the index. Adding an EndMerge log fails if
   there is no corresponding StartMerge log, or if the new segment ID already
   exists, or if any of the old segment IDs are no longer active or if a
-  CancelMerge operation took place.
+  CancelMerge operation took place. In general, none of these failure
+  conditions should ever occur (except perhaps CancelMerge in exceptional
+  circumstances), so they are mostly just sanity checks.
 * DeleteDocuments(segmentDocID...) - This indicates that one or more documents
   have been deleted from the index by recording a document's internal unique
   ID. (Which corresponds to the pair of segment ID and doc ID.) Searches must
-  remove documents recorded in this log entry.
+  remove documents that are recorded in this log entry from their results
+  before returning to that caller.
 
 From this log, it should be clear how to compute the active set of segments
 at any particular time. Since adding a new entry to this log should generally
@@ -490,7 +655,8 @@ problems with this approach as I see it:
 2. They are really only good for exclusive locks. Which means we can't do
    something like, "lock these specific bytes in this segment tombstone file,"
    which would permit multiple processes to delete documents from the same
-   segment simultaneously.
+   segment simultaneously. Although, above we concluded that we should just
+   avoid synchronization here altogether and use a full byte for each document.
 
 At this point in time, it's hard to say with much certaintly how important (2)
 is, but my instinct is that we really should reduce contention as much as
@@ -525,10 +691,11 @@ that they are only used on some platforms/environments.
 
   {index-name}/
     transaction.log
+    [transaction.log.rollback]
     [transaction.log.lock]? (non-Linux/Windows)
     segment.{segmentID}.idx
     segment.{segmentID}.tomb
-    [segment.{segmentID}.tomb.lock]? (non-Linux/Windows)
+    [segment.{segmentID}.idmap] (ensuring ACID for deletes)
     merges/
       {transactionID}.active
     handles/
@@ -544,9 +711,16 @@ time:
 * On Windows, its native `LockFileEx` APIs are used. As with Linux, explicit
   lock files are never needed.
 * On all other platforms (including macOS), the old school `O_EXCL` lock file
-  approach is used for `transaction.log.lock` and
-  `segment.{segmentID}.tomb.lock`, while POSIX `fcntl` locks are used for
-  merges/{transactionID}.log` and `handles/{handleID.log}`.
+  approach is used for `transaction.log.lock`, while POSIX `fcntl` locks are
+  used for merges/{transactionID}.log` and `handles/{handleID.log}`.
+  (N.B. Perhaps we could use POSIX `fcntl` locks on the transaction log by
+  using the Nakala handle ID for the byte range offset?)
+
+TODO: Revise this section. We really probably want `flock` on macOS for the
+transaction log, so that we can support creating many readers simultaneously.
+It should be possible to use feature-sniffing at runtime to determine if the
+`flock` implementation is broken, and perhaps fall back to old school lock
+files.
 
 The last bullet point deserves a bit more explanation. POSIX locks are okay in
 this case since only a single thread will ever hold locks on these files at
@@ -598,15 +772,10 @@ extremely heavy load on a Nakala index on macOS?
 ### Index synchronization
 
 In this section, we'll go over the particulars of synchronization in more
-detail. To make things easier to digest, I'll briefly summarize all areas of
-storage level synchronization required by Nakala:
+detail. Most of the synchronization isn't too difficult to describe:
 
 * The transaction log can only have one writer at any point in time. It may
   have multiple readers.
-* Writing tombstones to segments requires a write lock on the file, although,
-  it could be done more granularly with a byte range lock if supported. (It
-  isn't clear whether this is beneficial or not, since acquiring a new lock for
-  every byte we write could result in quite a bit of overhead.)
 * Determining whether a merge is complete or not requires synchronizing on the
   active merge files.
 * Similarly, determining whether a handle has stopped reading the index or not
@@ -640,7 +809,10 @@ synchronization:
   (optionally) merged together.
 * Reading from a segment index also doesn't require synchronization, as once a
   segment index has been written, it is never modified again.
-*
+* Reading/writing tombstones to segments needs no synchronization between the
+  deletion status of each document is represented by a single byte. So writing
+  a tombstone always means writing the byte `0xFF`. Even if two processes race,
+  it doesn't matter which wins, so long as `0xFF` gets written.
 
 The top-most form of synchronization is on the transaction log. What we
 want here is a shared/exclusive lock, where reading acquires a shared lock
@@ -658,7 +830,7 @@ with other threads within the same process. (So that rules out POSIX locks.)
 Once a shared lock is obtained, it makes note of the ID of the most recent
 entry in the log. The handle then assigns itself an ID (say, from the current
 timestamp) and attempts to create a new file with `O_EXCL` set with the name
-`{logid}_{handleid}`. If it doesn't succeed, then the handle should generate a
+`{logid}\_{handleid}`. If it doesn't succeed, then the handle should generate a
 new ID and try again. If it does, then the handle should acquire an exclusive
 lock on this file. The handle should then read the contents of the transaction
 log into memory (explained in the next paragraph). Once done, the handle can
@@ -687,7 +859,8 @@ structure:
 This in-memory structure represents a "snapshot" of the index at a particular
 point in time. So long as the handle for this snapshot remains open and is not
 updated to a new snapshot, querying with this snapshot will continue to work
-correctly and should always produce deterministic results.
+correctly and should always produce deterministic results, including with
+respect to deleted.
 
 Other than generating a segment ID, no synchronization is needed when indexing
 new documents until they need to be committed. Namely, writing a new segment
@@ -706,7 +879,20 @@ that we haven't seen yet), it follows that even if it did correspond to an old
 segment, it is no longer in the transaction log and therefore won't be tampered
 with.
 
+BREADCRUMBS: Touch on active merge and handle files. This should lead into the
+next section about compaction, since compaction needs to know the position of
+the oldest reader in the log. (But also can't compact past a `StartMerge`
+without a corresponding `CancelMerge`/`FinishMerge`.
+
+### Log and index compaction
+
+BREADCRUMBS: This is Nakala's "checkpoint" process.
+
 
 ## Durability
 
-https://danluu.com/file-consistency/
+BREADCRUMBS: https://danluu.com/file-consistency/ --- main gist is that we have
+to checksum everything and ensure there is always a recovering strategy if we
+crash during I/O. So everything needs to end in one last atomic action that
+either makes things visible or indicates to a future Nakala handle that there
+has been corruption and it should automatically recover.
