@@ -437,7 +437,11 @@ disk. Conveniently, this also means that we aren't tantilized into shoving this
 mapping into heap memory. We can simply memory map the file and use it directly
 as the doc ID map when writing the merged posting lists.
 
-## Transaction log
+Also, if push came to shove, we could stream the skip list to disk as well, and
+then read it back once we're ready to serialize it. But I don't think it will
+use a lot of memory in practice.
+
+## Transaction log and synchronization
 
 A Nakala index is formed of zero or more segments. Every search request must be
 run against every segment, and results must be merged. Over time, as the
@@ -497,28 +501,37 @@ The types of log entries are as follows:
   are now eligible for merging again. This can be explicitly committed by an
   in-progress merge that has been cancelled for some reason. (Whether by the
   caller or a signal handler trying to clean up resources used by the process.)
-* EndMerge(newSegmentID, oldSegmentID...) - This indicates that a merge has
-  finished and a new segment has been added to the index. The old segment ID
-  list must correspond to a previously recorded StartMerge log, and now point
-  to segments that are no longer in the index. Adding an EndMerge log fails if
-  there is no corresponding StartMerge log, or if the new segment ID already
-  exists, or if any of the old segment IDs are no longer active or if a
-  CancelMerge operation took place. In general, none of these failure
-  conditions should ever occur (except perhaps CancelMerge in exceptional
-  circumstances), so they are mostly just sanity checks.
+* EndMerge(newSegmentID, oldSegmentID..., deletedSegmentDocID...) - This
+  indicates that a merge has finished and a new segment has been added to the
+  index. The old segment ID list must correspond to a previously recorded
+  StartMerge log, and now point to segments that are no longer in the index.
+  Adding an EndMerge log fails if there is no corresponding StartMerge log, or
+  if the new segment ID already exists, or if any of the old segment IDs are
+  no longer active or if a CancelMerge operation took place. In general, none
+  of these failure conditions should ever occur (except perhaps CancelMerge in
+  exceptional circumstances), so they are mostly just sanity checks. If any of
+  the old segment IDs have been referenced by a DeleteDocuments entry since the
+  corresponding StartMerge entry, then those IDs must be remapped and included
+  as the deletedSegmentDocIDs as part of this entry.
 * DeleteDocuments(segmentDocID...) - This indicates that one or more documents
   have been deleted from the index by recording a document's internal unique
   ID. (Which corresponds to the pair of segment ID and doc ID.) Searches must
   remove documents that are recorded in this log entry from their results
-  before returning to that caller.
+  before returning to that caller. If any of the segments referenced in this
+  entry are no longer live, then the IDs must be remapped to their new
+  identifiers before the entry is committed.
 
-From this log, it should be clear how to compute the active set of segments
-at any particular time. Since adding a new entry to this log should generally
-be quite cheap, and to keep things simple, we require that there can only be
-one writer to the log at any particular time. Each write will check that the
-new log entry is valid to add and will fail if not, based on the state of the
-log at the time of the write. We can enforce a single writer via file locking
-(described in its own section below).
+From this log, it should be somewhat clear how to compute the active set of
+segments at any particular time. Since adding a new entry to this log should
+generally be quite cheap, and to keep things simple, we require that there can
+only be one writer to the log at any particular time. Each write will check
+that the new log entry is valid to add and will fail if not, based on the state
+of the log at the time of the write. We can enforce a single writer via file
+locking (described in its own section below). In addition to checks, some
+entries (like DeleteDocuments and EndMerge) may require some updating if there
+were log entries created since its snapshot and at the time of commit. (For
+example, if a long running Nakala handle deletes a document in a segment that
+was merged after the Nakala handle was opened.)
 
 There are a few remaining hiccups here.
 
@@ -1059,7 +1072,154 @@ process in more detail.
 
 ### Log and index compaction explained
 
-BREADCRUMBS: Walk through the actual algorithm, step-by-step.
+This section attempts to describe the _full_ process of compaction, including
+both the log and the index. To briefly recap, compaction is the process of
+deleting things from storage that are no longer in use. This consists of three
+things:
+
+1. Segments that have been merged, and where no active Nakala handles exist
+   that are using a snapshot of the index before the merge.
+2. The ID map discussed above (in the section on merging) that is produced only
+   for segments that are the result of a merge, once all segments that formed
+   the merged segment have been removed in (1).
+3. Any transaction log entry that occurs before the oldest active Nakala
+   handle and is no longer needed. We'll address each possible entry for
+   completeness:
+     * `AddSegment` can be removed if it has been merged into another segment
+       and that merge occurred before the oldest active handle's snapshot.
+       Removing an `AddSegment` must coincide with removing the segment index
+       from storage.
+     * `StartMerge` can be removed if its corresponding `CancelMerge` or
+       `EndMerge` exists and was committed before the oldest active handle's
+       snapshot. If a `CancelMerge` was found, that it can be removed as well.
+       Removing this entry does not correspond to removing anything from
+       storage.
+     * `CancelMerge` can be only be removed when its corresponding `StartMerge`
+       entry is removed.
+     * `EndMerge` can be removed in similar circumstances as `AddSegment`.
+       Namely, if the segment it produced has itself been merged into another
+       segment and that merge occurred before the oldest active handle's
+       snapshot. Removing an `EndMerge` must coincide with removing the segment
+       index from storage. Note that an `EndMerge` can include re-mapped
+       deleted doc IDs that were committed after the corresponding
+       `StartMerge`, however, if this segment has already been merged into
+       another, then those deleted doc IDs were necessarily omitted from the
+       merged segment and can thus be removed from the log. An `EndMerge` entry
+       might also be _rewritten_ to omit its deleted doc IDs (if it has any)
+       using the same procedure as `DeleteDocuments`.
+     * `DeleteDocuments` can be removed if it occurs before the oldest active
+       handle and once all of its doc IDs either reference segments that no
+       longer exist or have been written as tombstones to their corresponding
+       segment. (Note that writing tombstones occurs as part of this compaction
+       process.)
+   Note that the above means that a transaction entry `B` that occurs after `A`
+   may actually be removed before `A` is, leaving "gaps" in the log. But this
+   is okay.
+
+As you can see, most of the complexity of compaction actually involves deciding
+what to do with each log entry. One of the key complexities of the transaction
+log is ensuring we don't drop deletes or allow them to refer to things that no
+longer exist (at the time of commit). This can happen in a few different ways
+if we aren't careful.
+
+For example, let's say `A` and `B` refer to two distinct open transactions
+(also called "handles"). Consider that `A` and `B` were opened at the same
+transaction `x`. `A` deletes document `foo` while `B` merges the segment `foo`
+was in into another segment. If `A` commits before `B`, then the merged segment
+won't incorporate the delete, since the snapshot it used to perform the merge
+occurred before the delete. Thus, when `B` is committed, the `EndMerge` entry
+must include the doc IDs for deletes that occurred after `x` in any segment
+that participated in the merge (where the IDs are remapped into the merged
+segment's ID space). Conversely, if `B` commits before `A`, then `A`'s delete
+will refer to a segment that is no longer live. Thus, subsequent snapshots will
+not observe the delete since they will never look at the segment it was deleted
+from because it isn't live. Thus, when `A` is committed, the `DeleteDocuments`
+entry must have all of its IDs that refer to segments that are no longer live
+remapped to their new identifiers before the entry is committed.
+
+The other thing worth touching on here is tombstoning. Tombstoning is the
+responsibility of the compaction process itself, since tombstoning is how we
+move deleted doc IDs out of the transaction log and into storage. This is
+advantageous because checking if a document is deleted using storage means we
+don't have to keep growing heap memory without bound in order to check whether
+a document is deleted or not. Writing tombstones to segments makes it possible
+to organize an on disk structure for efficient checks. The transaction log does
+not, because the deleted doc IDs are scattered throughout different log entries
+instead of organized in one place for each segment.
+
+Tombstoning occurs whenever we examine a `DeleteDocuments` entry or an
+`EndMerge` entry with remapped deleted doc IDs that occurs before the oldest
+active handle. It looks like this:
+
+* For each deleted doc ID, check the in-memory snapshot for whether it
+  references a segment ID that is live. If it does, then write a tombstone for
+  it.
+* `fsync` the tombstones. (We talk about durability in more detail in the
+  [durability](#durability) section.)
+* Once all of the tombstones are written, either remove the `DeleteDocuments`
+  entry or rewrite the `EndMerge` entry without its remapped delete doc IDs.
+
+We note that this is safe because if the segment is no longer live in the
+snapshot, then the segment must have been merged into another segment. Since
+merges handle document deletes correctly (even in cases where the deletes occur
+during a merge), it follows that the deleted doc ID is either recorded in a
+subsequent `EndMerge` entry in its remapped form or absent entirely from the
+merged segment (if the merge began after the delete was committed). We note
+that the deleted doc ID cannot be tombstoned anywhere---even in its remapped
+form---because that can only happen during compaction and compaction hasn't
+visited that far in the log yet. In the case where the deleted doc ID refers to
+a live segment, then our `fsync` on the corresponding tombstone file ensures it
+is durable in storage.
+
+Other than dealing with durability in the face of crashes (another tricky
+complication), I believe that just about covers the guts of compaction. So now
+we can more succinctly write out the sequence of steps:
+
+* When compaction starts, acquire an exclusive lock to the transaction log
+  and open a handle, such that it points to the most recent transaction.
+* Discover the oldest active handle by listing the handles directory and
+  sorting its contents by transaction ID in ascending order. Then attempt to
+  acquire an exclusive lock on the first one. If it succeeds, remove the file
+  and continue until all files have been remove or until acquiring a lock
+  fails. The former case isn't technically possible, since compaction is itself
+  a handle. In the latter case, the file at which acquiring a lock fails
+  implies the handle is still active and is thus the oldest handle (since
+  transaction IDs are monotonically increasing).
+* Open a new transaction log for writing the compacted form.
+* For each entry in the current log, use the entry-specific process described
+  above to determine whether to leave it, remove it or rewrite it.
+* If there is any action associated with removing or rewriting the entry (such
+  as deleting segments from storage or writing tombstones), do that now.
+* Once the action is complete and durable, either omit writing the entry to the
+  new log or rewrite it, as appropriate.
+* Upon completion, replace the old log with the new one. (Again, we are waving
+  are hands a bit here, since the details of how exactly we do this are the
+  domain of crash proof durability.)
+
+There are some potential deviations we may make here, for performance reasons,
+but they do complicate the procedure somewhat. (So we'll likely start without
+them.) Namely, writing tombstones could be quite I/O heavy and expensive,
+especially since we require the `fsync` and since it is random I/O, not
+sequential I/O (to support a random access pattern). So if there are a lot of
+tombstones to write, it is likely not appropriate to hold an exclusive lock on
+the log file for that entire time.
+
+We can limit the time we hold the lock by making compaction incremental.
+Namely, when we come across an entry that requires writing a lot of tombstones,
+then we can drop the exclusive lock and write the tombstones without any
+synchronization whatsoever. We can record that we did this in memory (and if we
+crash, it's okay to repeat the work) and reacquire the lock once the tombstones
+are finished writing to disk. Then we simply restart the compaction process,
+but skipping over the process of writing tombstones if it's required.
+
+Of course, this introduces its own problems. For example, this could
+potentially result in pathological behavior where compaction never completes if
+deletes keep getting added during the time in which the exclusive lock is not
+held. We could resolve this with a heuristic: if the compaction process has
+been repeated more than N times, then stop dropping the lock and prioritize
+completing compaction. Although, if deletes are truly streaming in that
+quickly, then its likely we will be spending a lot of time in compaction, so
+there will probably be other things to tweak.
 
 
 ## Durability
@@ -1069,3 +1229,8 @@ to checksum everything and ensure there is always a recovering strategy if we
 crash during I/O. So everything needs to end in one last atomic action that
 either makes things visible or indicates to a future Nakala handle that there
 has been corruption and it should automatically recover.
+
+Tentative decision: when compaction starts, the current log is copied to a
+backup file and the new log is written to the actual log file. Once complete,
+the backup file is removed. When opening a Nakala index, this backup file must
+be checked for, and if it exists, a recovery process must be initiated.
