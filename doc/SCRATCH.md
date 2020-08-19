@@ -726,8 +726,6 @@ time:
 * On all other platforms (including macOS), the old school `O_EXCL` lock file
   approach is used for `transaction.log.lock`, while POSIX `fcntl` locks are
   used for merges/{transactionID}.log` and `handles/{handleID.log}`.
-  (N.B. Perhaps we could use POSIX `fcntl` locks on the transaction log by
-  using the Nakala handle ID for the byte range offset?)
 
 TODO: Revise this section. We really probably want `flock` on macOS for the
 transaction log, so that we can support creating many readers simultaneously.
