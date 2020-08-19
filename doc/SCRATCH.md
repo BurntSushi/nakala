@@ -441,7 +441,7 @@ Also, if push came to shove, we could stream the skip list to disk as well, and
 then read it back once we're ready to serialize it. But I don't think it will
 use a lot of memory in practice.
 
-## Transaction log and synchronization
+## Transaction log
 
 A Nakala index is formed of zero or more segments. Every search request must be
 run against every segment, and results must be merged. Over time, as the
