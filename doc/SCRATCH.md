@@ -1232,3 +1232,10 @@ Tentative decision: when compaction starts, the current log is copied to a
 backup file and the new log is written to the actual log file. Once complete,
 the backup file is removed. When opening a Nakala index, this backup file must
 be checked for, and if it exists, a recovery process must be initiated.
+
+More: transaction log should just be a sequence of commits. Reading it requires
+reading through all of them. Each commit has a checksum. If the reader can't
+read a commit, then it stops there and initiates a recovery process, which
+removes everything after the last valid commit found. This is legal because an
+invalid commit implies that it never finished completing the commit and
+therefore never returned success to the caller.
