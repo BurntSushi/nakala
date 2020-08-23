@@ -578,6 +578,128 @@ transaction log, or alternatively use the OS-native advisory lock technique.
 killed without the chance to unmark itself.)
 
 
+## Generating unique identifiers
+
+Regretably, I found precious little material on how to generate unique
+identifiers in the context of an embedded database. It's likely I'm not looking
+in the right places, but search results were flooded with how to generate
+unique IDs in a cluster environment. Many other search results were roughly
+equivalent to "just use UUIDs." While UUIDs are in practice unique, they also
+tend to use up more space than we need. Also, we are not in a cluster
+environment and so it is not terribly burdensome to generate our own
+identifiers, although it is subtle.
+
+For motivation, we use unique identifiers for generating segments and handle
+IDs. (Note that handle IDs and transaction IDs are not the same. Handle IDs are
+assigned once a transaction is open, but a transaction ID is assigned only at
+commit time. At commit time, an exclusive lock is required, and so generating
+an ID in this context merely requires looking at the ID of the most recently
+committed transaction.) It would also be nice to provide ID generation to users
+of the Nakala library for arbitrary purposes, in case they don't have some
+external source of identifiers, although that seems unlikely.
+
+Obviously, generating unique identifiers requires some kind of disk
+persistence, and this is why it's tricky. We need to ensure that we never
+hand out a duplicate ID and we also need to ensure that we never corrupt our
+ID generation state, even in the face of application crashes or abrupt power
+failure. Since writing to disk and ensuring its safe even from abrupt power
+failure is costly, we must also amortize this operation. That is, whenever we
+read the next ID from disk, we will actually read a block of IDs. The process
+can then freely allocate from that block until it runs out, and only then, does
+the process need to go back to disk.
+
+So here's what we do. The file for the ID generation will store the start of
+the next block to allocate four times:
+
+    u64LE           u64LE           u64LE           u64LE
+    canonical       error           recovery        error
+
+Whenever a new block is requested, we follow the process below:
+
+1. Acquire an exclusive lock on the ID file.
+2. Read the next block from the file and keep it in memory. This must check
+   that all four u64LEs in the file are equivalent. If they aren't, then
+   initiate a recovery process (explained below) and start again.
+3. Compute the start of the next block, and store it in `next`.
+4. Perform the following I/O operations:
+    a. pwrite(file, [next, next], 0)
+    b. fsync(file)
+    c. pwrite(file, [next, next], 16)
+    d. fsync(file)
+5. Upon success, return the block read in (2), which is the block immediately
+   preceding `next`.
+
+The key here is that we write the ID in such a way where any interruption will
+never leave us in a state that we 1) can't recover from and 2) will ever hand
+out the same block twice. (2) is covered since we don't return the next block
+until we have confirmed success from the OS that the next block has been made
+durable on disk.
+
+(1) is a bit harder to explain. The idea here is that we write the ID twice in
+the file (first the canonical and then the recovery), but each time we write
+it, we also include an error checking mechanism to ensure the write succeeded.
+In this case, the error checking mechanism is to simply write the next block
+again. When reading the file, the error check will fail if the `error` is not
+equivalent to the `primary`.
+
+Error checking can fail either when we read the `canonical` or the `recovery`
+number. If error checking fails when reading `canonical`, then `recovery`
+will never fail error checking because the only way for the `canonical` error
+check to fail is if 4a or 4b failed and 4c did not run. Similarly, if error
+checking fails when reading `recovery`, then `canonical` will never fail error
+checking because the only way for the `recover` error check to fail is if 4c
+or 4d failed, which implies that both 4a and 4b succeeded, since 4c can only
+execute if 4b succeeded. The `fsync` call in 4b is critical here: it forces
+that 4a will be made durabile in disk before ever attempting 4c. Therefore, it
+is impossible for both the `canonical` and `recovery` numbers to fail the error
+check.
+
+This property leads to the following recovery mechanism (this process is only
+invoked when one of the error checks fails):
+
+1. If `primary` could not be read, then it must be possible to read `recover`
+   such that `recover` refers to next block of IDs that has never been returned
+   to the user (if it were, then writing `primary` would have succeeded). Thus,
+   copy `recovery` to `primary` (as in (4) above) and restart ID generation.
+2. If `recovery` could not be read, then it must be possible to read `primary`
+   such that `primary` refers to the block _after_ the next block of IDs that
+   should be returned to the user. Thus, subtract a block from `primary` and
+   write that to the file as in (4) above and restart ID generation.
+
+In this way, no matter where a crash or power failure occurs, we can always
+generate unique IDs and be guaranteed to never lose our state.
+
+The only thing remaining is to address the initial state of ID generation.
+Generally speaking, the initial conditions are satisfied by virtue of having a
+valid index. That is, there will be a (yet to be determined, likely the
+presence of some file) indicator that an index has been fully created that
+all other accesses will recognize. If this indicator doesn't exist, then the
+index is not assumed to be created and thus no ID generation can occur. If the
+indicator does exist, then by virtue of it existing, any ID generation file
+will have been made durable to disk with a correct format.
+
+If it is possible for arbitrary ID generators to exist, then the initial
+conditions for an ID generator file can occur at any time. We address this by
+detecting the special case of a zero file size. If the ID generator file as
+zero size, then the handle accessing the file should acquire an exclusive lock
+and initialize the ID generator (by writing 4 u64LEs as per (4) above). Even if
+some other process initially created the ID generator, all ID generator
+initialization is the same. The other process that created the file will simply
+detect that the file has already been initialized once it acquired the
+exclusive lock. (This is just an idea. Perhaps it would be simple to just
+acquire an exclusive lock on the transaction log first, which would serialize
+ID generator creation and would probably be much simpler.)
+
+It's worth noting that this scheme is potentially more complex than necessary.
+Namely, it's likely that writing such a small number of bytes (32 in this case)
+will always be guaranteed to be atomic. That is, it will either completely
+succeed or completely fail. Despite this guarantee being mentioned by various
+folks with a lot of credibility, it's not clear where this guarantee actually
+comes from, whether it really exists or whether it will always exist.
+Therefore, we do not assume the existence of atomic writes under a small
+number.
+
+
 ## File locking and index structure
 
 It turns out that file locking is a total and complete pit of despair. There's
@@ -1220,22 +1342,169 @@ quickly, then its likely we will be spending a lot of time in compaction, so
 there will probably be other things to tweak.
 
 
-## Durability
+## ACID
 
-BREADCRUMBS: https://danluu.com/file-consistency/ --- main gist is that we have
-to checksum everything and ensure there is always a recovering strategy if we
-crash during I/O. So everything needs to end in one last atomic action that
-either makes things visible or indicates to a future Nakala handle that there
-has been corruption and it should automatically recover.
+This section discusses how Nakala upholds atomicity, consistency, isolation and
+durability (ACID). Many of these properties have already been discussed
+above. This section tries to more specifically address them in order to make
+the guarantees that Nakala provides clearer.
 
-Tentative decision: when compaction starts, the current log is copied to a
-backup file and the new log is written to the actual log file. Once complete,
-the backup file is removed. When opening a Nakala index, this backup file must
-be checked for, and if it exists, a recovery process must be initiated.
+At a high level, Nakala provides a "repeatable read" level of ACID, and does
+not actually support full serializability. Full serializability refers to the
+idea that if two or more transactions are running concurrently, then they will
+only all successfully commit if the end result would be the same if each
+transaction were run linearly in sequence in _any_ order. The reasons why this
+aren't supported (and possible ideas for supporting it in the future) are
+explained in the last sub-section below.
 
-More: transaction log should just be a sequence of commits. Reading it requires
-reading through all of them. Each commit has a checksum. If the reader can't
-read a commit, then it stops there and initiates a recovery process, which
-removes everything after the last valid commit found. This is legal because an
-invalid commit implies that it never finished completing the commit and
-therefore never returned success to the caller.
+### Atomicity
+
+### Consistency
+
+### Isolation
+
+### Durability
+
+Durability refers to the property that if Nakala reports that a commit is
+successful, then any kind of crash (including abrupt power failure) will not
+cause the loss of the data included in that commit. Durability does not,
+however, guarantee that data that hasn't been committed or fails to commit is
+retained. In fact, there is a strict correspondence: if a commit succeeds, then
+that data is durable, and if a commit does not succeed then the data is not
+part of the index---not even partially (which is also part of the atomicity
+guarantee).
+
+Generally speaking, there are three important aspects to ensuring durability:
+
+1. The strategy employed to ensure that data is truly written to disk. Namely,
+   because of caching, passing data to `write` to a file does *not* necessarily
+   write it to disk. Instead, the data is likely put into a cache somewhere and
+   written to disk later. The typical way to ensure durability is to call
+   `fsync` on Unix platforms.
+2. The design of the format on disk must make it possible to detect that there
+   is some kind of corruption. Usually this means baking some kind of error
+   detection (like a checksum) into the data on disk.
+3. The recovery process that occurs when data on disk has been corrupted. That
+   is, it is detected and the index is returned to a non-corrupt state.
+
+We'll discuss each of these in more detail below, but Dan Luu's
+[article on file consistency](https://danluu.com/file-consistency/)
+is about as close to required reading as it gets. (And if you're doubly
+curious, read the linked papers.)
+
+#### fsync
+
+First up is the `fsync` strategy. This is important to cover for two reasons.
+Firstly, getting `fsync` correct is notoriously difficult, primarily because
+getting it wrong can be hard to observe without proper testing infrastructure.
+You tend to only see things not work when disaster occurs and disaster occurs
+relatively infrequently. Secondly, many database systems either omit `fsync`
+calls or provide a way to disable them through configuration. (Where the main
+benefit of this is performance, since it yields control of I/O to the OS, which
+presumably will schedule such things more efficiently.) For example, SQLite
+provides such options with its `synchronous` pragma. When `fsync` calls are
+omitted or reduced, then durability is typically guaranteed in the face of
+application crashes, but not in the face of abrupt power loss.
+
+As for Nakala, its default configuration will always be fully durable, even in
+the face of power loss, although it may expose options like SQLite that permit
+toggling it if performance is more important. The crucial bit here is that the
+default configuration should be safe in all cases, even at the expense of
+performance.
+
+For those reading the Nakala code---while this isn't a perfect analogy---it
+helps to think of `fsync` as a memory barrier, except it occurs with respect to
+I/O. While strictly speaking it is something that forces data to be written to
+disk, in terms of reasoning about concurrency, it helps to think about it as
+something that imposes an _ordering_ between two I/O operations. Generally
+speaking, two `write` calls may technically occur in any order, so if
+durability (or atomicity) _requires_ one to be made durable before the other
+may proceed, then an `fsync` call (or equivalent) is required.
+
+#### On disk format
+
+There are two primary error checking techniques we use in our on-disk format to
+guarantee durability:
+
+1. In very simple cases, where error checking only needs to occur on a single
+   number, we simply write the same number twice. If we ended up with a partial
+   write, then the first and second numbers won't be equivalent and the error
+   checking will fail. (This technique is used in ID generation.)
+2. In other cases, were use a CRC32 checksum. This is principally used in the
+   transaction log.
+
+Namely, the transaction log is a sequence of length-prefixed transactions. The
+data in each doesn't matter too much for our purposes, but the end of each
+transaction includes a checksum for the preceding bytes of that transaction.
+Thus, if a transaction is only partially written, it will be possible to detect
+this via a checksum failure.
+
+It's worth noting that there are many places where checksums _aren't_ used, or
+rather, where they are not necessary for durability. For example, while each
+segment includes a checksum, those checksums are never used for durability.
+They are only ever used for checking the integrity of the index, perhaps due to
+some other form of corruption. The reason why we don't need checksums for
+durability in segments is because segments are immutable. That is, before we
+wite a commit a transaction referencing a segment, we first make sure the
+segment is durable, and only then do we start writing to the transaction log.
+Since we never subsequently mutate it, the presence of the transaction itself
+is a receipt that the segment is durable.
+
+The index wide configuration file is handled similarly to the transaction log,
+since it can be mutated. In this case though, there is only one checksum for
+the entire configuration file, since it is generally small.
+
+#### Recovery
+
+Recovery refers to the process by which opening a Nakala index will "self heal"
+itself in case there was an application crash or an abrupt power failure in the
+middle of a write.
+
+Most of the writing that Nakala does (segment files) is not subject to this
+consideration, which simplifies things considerably. Namely, if a crash occurs
+while writing a segment, then it follows that it was never committed and thus
+there are no durability guarantees in play. (We do however omit details of how
+to discover and remove incomplete segment files. This is "just" a space
+optimization rather than a correctness issue.)
+
+Thus, the main place where recovery matters is the transaction log. The
+transaction log is the single source of truth for which segments are "live" in
+the index, and thus, which segments must be consulted when executing a search.
+
+Given the fact that each transaction is checksummed, it is trivial to determine
+where the log has been corrupted. And thus, it is also possible to determine
+which transactions are still valid: every transaction up to the corrupt one.
+The corrupt transaction implies that it was not fully written, thus the commit
+never reported success to the caller and thus, that transaction (and everything
+after it) can "simply" be deleted from the log.
+
+In practice, things are a touch more complicated than this, particularly with
+respect to compaction. Namely, log compaction requires rewriting the log,
+potentially in its entirely. This rewriting could fail at _any_ point, and
+thus, rewriting the log in place could result in catastrophic data loss. There
+are a couple different ways to approach it, but one simple way that I intend to
+implement is:
+
+1. When compaction starts, copy the existing log to `transaction.log.backup`.
+2. Truncate `transaction.log` and rewrite it, in accordance with compaction.
+3. Once compaction completes, make the transaction log durable and then finally
+   remove the `transaction.log.backup`. This ordering is important, since the
+   removal of the backup log indicates the completion of compaction. Thus, we
+   must make sure the log is durable before removing the backup.
+
+And then, our recovery process is the detection of `transaction.log.backup`. If
+it exists when one opens a handle, then it necessarily implies that compaction
+experienced a crash part way through. (If compaction is in progress, then it
+holds an exclusive lock, and thus no other process will try to read the log.)
+When this condition occurs, a recovery process that copies the
+`transaction.log.backup` back to `transaction.log` must be complete. Once done,
+things may resume as normal. (In this case, no data is lost. It's possible that
+compaction has written some tombstones or removed some segments that are no
+longer being used, but both of these things are idempotent. They will simply be
+retried.)
+
+
+### Stopping short of full serializability
+
+Main idea: would require us to check deletes with the user ID, and would thus
+need to store the user ID in the transaction log.
