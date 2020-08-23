@@ -1,7 +1,9 @@
-This is a "scratch" document that was primarily used during initial development
-of Nakala. It keeps track of constraints, architecture, design and nasty
-implementation details that I used while writing the code. The two different
-use cases I had in mind driving everything were:
+# Plan
+
+This is a "scratch" planning document that was primarily used during initial
+development of Nakala. It keeps track of constraints, architecture, design
+and nasty implementation details that I used while writing the code. The two
+different use cases I had in mind driving everything were:
 
 * To serve as the name index for imdb-rename, which just needs to index short
   name strings. Notably though, multiple names can be indexed for the same ID.
@@ -14,7 +16,34 @@ Of course, I tried to keep generality in mind as well, as I've used IR systems
 in many other contexts too. And tried to think about how others might use this
 code, but didn't step too far outside my comfort zone.
 
-## Novelty prelude
+## Table of Contents
+
+* [Novelty](#novelty)
+* [Things Nakala should NOT do](#things-nakala-should-not-do)
+* [Things Nakala should do](#things-nakala-should-do)
+* [Handling identifiers](#handling-identifiers)
+* [Handling deletes](#handling-deletes)
+* [Merging segments](#merging-segments)
+* [Transaction log](#transaction-log)
+* [Generating unique identifiers](#generating-unique-identifiers)
+* [File locking and index structure](#file-locking-and-index-structure)
+    * [File locking prelude](#file-locking-prelude)
+    * [Index structure](#index-structure)
+* [Index synchronization](#index-synchronization)
+    * [Synchronization at a glance](#synchronization-at-a-glance)
+    * [Motivating compaction](#motivating-compaction)
+    * [Log and index compaction explained](#log-and-index-compaction-explained)
+* [ACID](#acid)
+    * [Atomicity](#atomicity)
+    * [Consistency](#consistency)
+    * [Isolation](#isolation)
+        * [Stopping short of full serializability](#stopping-short-of-full-serializability)
+    * [Durability](#durability)
+        * [fsync](#fsync)
+        * [On disk format](#on-disk-format)
+        * [Recovery](#recovery)
+
+## Novelty
 
 Before diving into details, it should be noted that almost no technique
 described in this document is novel. Maybe the _combination_ of these things is
@@ -709,7 +738,7 @@ be a good high level summary: https://gavv.github.io/articles/file-locks/
 This section mostly serves as a bit of background reading before the next
 section on index synchronization.
 
-### Prelude
+### File locking prelude
 
 I'd like to quickly summarize the options available to us:
 
