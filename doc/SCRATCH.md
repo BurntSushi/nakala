@@ -501,18 +501,18 @@ The types of log entries are as follows:
   are now eligible for merging again. This can be explicitly committed by an
   in-progress merge that has been cancelled for some reason. (Whether by the
   caller or a signal handler trying to clean up resources used by the process.)
-* EndMerge(newSegmentID, oldSegmentID..., deletedSegmentDocID...) - This
-  indicates that a merge has finished and a new segment has been added to the
-  index. The old segment ID list must correspond to a previously recorded
-  StartMerge log, and now point to segments that are no longer in the index.
-  Adding an EndMerge log fails if there is no corresponding StartMerge log, or
-  if the new segment ID already exists, or if any of the old segment IDs are
-  no longer active or if a CancelMerge operation took place. In general, none
-  of these failure conditions should ever occur (except perhaps CancelMerge in
-  exceptional circumstances), so they are mostly just sanity checks. If any of
-  the old segment IDs have been referenced by a DeleteDocuments entry since the
+* EndMerge(newSegmentID, oldSegmentID...) - This indicates that a merge has
+  finished and a new segment has been added to the index. The old segment
+  ID list must correspond to a previously recorded StartMerge log, and now
+  point to segments that are no longer in the index. Adding an EndMerge log
+  fails if there is no corresponding StartMerge log, or if the new segment ID
+  already exists, or if any of the old segment IDs are no longer active or
+  if a CancelMerge operation took place. In general, none of these failure
+  conditions should ever occur (except perhaps CancelMerge in exceptional
+  circumstances), so they are mostly just sanity checks. If any of the old
+  segment IDs have been referenced by a DeleteDocuments entry since the
   corresponding StartMerge entry, then those IDs must be remapped and included
-  as the deletedSegmentDocIDs as part of this entry.
+  as a preceding DeleteDocuments entry in the same transaction.
 * DeleteDocuments(segmentDocID...) - This indicates that one or more documents
   have been deleted from the index by recording a document's internal unique
   ID. (Which corresponds to the pair of segment ID and doc ID.) Searches must
@@ -1255,7 +1255,8 @@ will refer to a segment that is no longer live. Thus, subsequent snapshots will
 not observe the delete since they will never look at the segment it was deleted
 from because it isn't live. Thus, when `A` is committed, the `DeleteDocuments`
 entry must have all of its IDs that refer to segments that are no longer live
-remapped to their new identifiers before the entry is committed.
+remapped to their new identifiers before the entry is committed. Failing to
+account for both of these cases results in a delete that is ignored.
 
 The other thing worth touching on here is tombstoning. Tombstoning is the
 responsibility of the compaction process itself, since tombstoning is how we
@@ -1349,19 +1350,169 @@ durability (ACID). Many of these properties have already been discussed
 above. This section tries to more specifically address them in order to make
 the guarantees that Nakala provides clearer.
 
-At a high level, Nakala provides a "repeatable read" level of ACID, and does
-not actually support full serializability. Full serializability refers to the
-idea that if two or more transactions are running concurrently, then they will
-only all successfully commit if the end result would be the same if each
-transaction were run linearly in sequence in _any_ order. The reasons why this
-aren't supported (and possible ideas for supporting it in the future) are
-explained in the last sub-section below.
 
 ### Atomicity
 
+Atomicity refers to the property that a change to Nakala's index either happens
+completely or not at all. From the user's perspective, this means that if they
+open a transaction, add some documents, delete some documents and then commit
+it, then either _all_ of the writes and the deletes will be executed
+successfully or _none_ of them will.
+
+Nakala generally guarantees atomicy via its transaction log. Namely, once the
+caller is ready to commit some writes, or deletes or a merge completes, then
+Nakala will lock the transaction log and write all necessary entries for that
+single transaction. That transaction includes a checksum, which means that if
+writing the transaction fails part way through, then reading the transaction
+can detect the corruption and drop it without sacrificing the integrity of the
+rest of the index.
+
+Similarly, if a transaction fails part way through before ever getting to the
+commit phase, and since the transaction log is the single point of truth for
+what is included in the snapshot of an index, it follows that no partial
+results are ever observed.
+
 ### Consistency
 
+Consistency refers to the property that every change made to a Nakala index is
+consistent with the invariants guaranteed by Nakala. Nakala has it somewhat
+easy on this front compared with other databases, especially relational
+databases. Namely, Nakala doesn't really impose any constraints on its data,
+and in particular, does not require that user IDs be unique. That is, a single
+user ID may refer to multiple documents in the index. (They are deduplicated at
+search time.)
+
+Nakala _does_ protect itself against potential bugs by checking invariants in
+the transaction log. For example, adding a new segment will fail if its ID
+already refers to an existing segment, but this failure scenario should never
+occur because our ID generation guarantees a unique ID. Similar constraints
+exist for merges.
+
 ### Isolation
+
+Isolation refers to the property that when concurrent transactions are
+executed, the resulting state of the database would be no different than if
+each of those transactions were executed serially, one after the other, in any
+order.
+
+In practice, guaranteeing such a strong level of isolation (usually referred to
+as "serializable") is not something that all databases provide, or at least,
+typically only provide through some sort of explicit configuration. (For
+example, in PostgreSQL, one must explicitly enable the "serializable" isolation
+level to get the strictest semantics. It is not enabled by default.)
+
+At a high level, Nakala provides a "repeatable read" level of isolation, and
+does not actually support full serializability. This means that dirty reads,
+non-repeatable reads and phantom reads are not possible. To be clear, we use
+the same
+[definitions as PostgreSQL does](https://www.postgresql.org/docs/9.5/transaction-iso.html)
+for those terms:
+
+* A **dirty read** is a read of data written by a concurrent _uncommitted_
+  transaction.
+* A **non-repeatable read** occurs when data changes from read to read within
+  the same transaction. That is, the data was modified by some other committed
+  transaction, and that change has now been observed within a single search.
+* A **phantom read** is like a non-repeatable read, but over the course of an
+  entire transaction. It occurs when two distinct reads (e.g., two different
+  searches) that are otherwise identical return two different results sets.
+  That is, a single transaction sees data committed by a concurrent
+  transaction.
+
+Nakala prevents all of these things by using a snapshot of the index at the
+time the transaction was opened. For the most part, the trickiest aspect of
+this is in handling deletes. Much of this has already been addressed as part of
+the sections above that explain deletes and the transaction log in more detail.
+But in essence, deletes are first recorded in the transaction log and then
+later moved to tombstones in their corresponding segment files once all open
+transactions are using snapshots _after_ the deletion transaction. This means
+that snapshots taken before the deletion transaction will never see those
+deletes, because we are careful not to eagerly create tombstones for them.
+
+Otherwise, the "repeatable read" isolation level is generally guaranteed by
+virtue of the fact that segments are never mutated once they have been created.
+
+With that said, a longer discussion about why Nakala stops here instead of
+guaranteeing full serializability is worth having, because it helps us
+understand the limitations of Nakala.
+
+#### Stopping short of full serializability
+
+Full serializability means that among concurrent transactions, executing them
+serially (one after the other with no overlap) in every order would have an
+equivalent outcome. This is a high bar to clear, and Nakala does not. Moreover,
+there is no way to turn it on.
+
+First, we should discuss how Nakala falls short. Deletes are the primary thing
+that cause problems. If Nakala did not support deletes, then it would trivially
+satisfy full serializability because documents would only ever be added (and
+multiple documents with the same user ID are allowed).
+
+Before explaining the example, it is important to briefly summarize how deletes
+work. The normal way to delete a document is to delete all documents associated
+with a particular user ID. The delete executes by searching the index for every
+segmentID-docID pair in the index associated with that user ID, and then
+records all of those pairs in the transaction log. (Only later, during log
+compaction, are tombstones to each individual segment written.) The critical
+part of this process is that user IDs themselves are never recorded. They are
+only used to lookup the segmentID-docID pairs.
+
+The simplest example of failing full serializability is when we have two
+concurrent transactions `A` and `B`, where `A` creates a new segment containing
+a document with a user ID `foo`, and where `B` deletes all documents containing
+user ID `foo`. If both transactions are opened at the same time (i.e., they use
+the same snapshot of the index), then `B`'s delete will only apply to documents
+available in `B`'s snapshot of the index. That is, if you instead applied `A`,
+committed, then started `B`, then `B`'s delete would include the document
+associated with `foo` that was added in `A`. But if you reverse the order,
+running `B` first, then the `foo` document that was added in `A` will not be
+deleted.
+
+Nakala will allow both of these transactions to commit without error, but full
+serializability would require Nakala to detect this type of scenario and either
+prevent one of the transactions from being committed or causing the results of
+the transactions to be consistent with respect to ordering.
+
+Detection is tricky, because deletes are only recorded via their
+segmentID-docID pairs and _not_ their user IDs. So for example, if `A` were
+committed first, then for `B` to detect that there is a new document that must
+be deleted, then `B` would need to re-run the search for `foo` on the segment
+introduced by `A`. Similarly, if `B` were committed first, then `A` would need
+to do the same: re-run the search for `foo` on its segment and mark any
+matching documents as deleted.
+
+The only possible way to implement this, that I see, is to record both the user
+IDs of deletes in addition to the segmentID-docID pairs, and then run the
+detection logic mentioned above. While there is nothing impossible about this,
+it can be quite expensive from a storage perspective and from a computation
+perspective, and likely means holding an exclusive lock on the transaction log
+for longer than we want. (Unless we do an incremental dance where we release
+the lock, make progress, acquire the lock and check whether our progress is
+enough.) But this makes an already complex thing even more complex. On the
+bright side, once log compaction runs, we can drop the user IDs, since they are
+only needed for resolving serializability conflicts.
+
+It's likely that this is the sort of thing that seems daunting to try to
+accomplish initially, but may not be too difficult to add once the full system
+is built.
+
+A similar version of this problem is discussed in the section above on
+log+index compaction, but in that case, it was a delete being executed
+concurrently with a merge, and the failure mode there is that a delete is
+actually outright ignored, even though the document existed in the snapshot of
+the transaction that executed the delete. This is a categorically different
+kind of problem from the serializability problem we just described. The former
+results in a delete that reports a successful deletion of a specific
+segmentID-docID pair that winds up getting dropped. The latter never reports
+any incorrect results; there's just an inconsistency with respect to
+concurrency.
+
+Other than the add/delete inconsistency, I do not think there are any other
+serializability concerns in Nakala. Namely, as long as deletes aren't dropped
+when a delete/merge occurs simultaneously, there are no serializability
+problems because a merge never adds new documents. I believe (though not 100%
+convinced) that a serializability problem requires that both an add and a
+delete occur, and in particular, where the delete occurs via a user ID.
 
 ### Durability
 
@@ -1502,9 +1653,3 @@ things may resume as normal. (In this case, no data is lost. It's possible that
 compaction has written some tombstones or removed some segments that are no
 longer being used, but both of these things are idempotent. They will simply be
 retried.)
-
-
-### Stopping short of full serializability
-
-Main idea: would require us to check deletes with the user ID, and would thus
-need to store the user ID in the transaction log.
