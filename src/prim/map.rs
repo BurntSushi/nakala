@@ -13,7 +13,7 @@ use crate::prim::ReadCursor;
 /// type of its data a priori.
 #[derive(Debug)]
 enum Value {
-    String(String),
+    String(Arc<str>),
     Bytes(Vec<u8>),
     Int(u64),
     Range(u64, u64),
@@ -47,7 +47,7 @@ pub struct Reader<B> {
     cursor: ReadCursor<B>,
     /// The position (into `cursor`) at which the encoding of the offsets of
     /// the map's entries starts. The offsets are a contiguous range of u64LEs
-    /// that point to each key, offsets are in the same order as the keys
+    /// that point to each key, where offsets are in the same order as the keys
     /// (which is lexicographic).
     ///
     /// This makes it possible to run a binary search on the map by using
@@ -63,9 +63,9 @@ impl<B: AsRef<[u8]>> Reader<B> {
     /// Create a new map reader from the given cursor. The end of the cursor
     /// should correspond to the end of the serialized bytes for the map.
     pub fn new(cursor: ReadCursor<B>) -> Result<Reader<B>, FormatError> {
-        // start_entries (u64) + start_offsets (u64) + len (u64)
+        // start (u64) + len (u64)
         cursor
-            .set_pos_rev(8 + 8 + 8)
+            .set_pos_rev(8 + 8)
             .context("failed to position to end of map")?;
         let start = cursor
             .read_usize_le()

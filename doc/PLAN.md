@@ -1610,14 +1610,15 @@ guarantee durability:
    number, we simply write the same number twice. If we ended up with a partial
    write, then the first and second numbers won't be equivalent and the error
    checking will fail. (This technique is used in ID generation.)
-2. In other cases, were use a CRC32 checksum. This is principally used in the
+2. In other cases, we use a CRC32 checksum. This is principally used in the
    transaction log.
 
-Namely, the transaction log is a sequence of length-prefixed transactions. The
-data in each doesn't matter too much for our purposes, but the end of each
-transaction includes a checksum for the preceding bytes of that transaction.
-Thus, if a transaction is only partially written, it will be possible to detect
-this via a checksum failure.
+Namely, the transaction log is a sequence of length-prefixed transactions,
+where each transaction contains one or more entries. The data in each doesn't
+matter too much for our purposes, but the end of each transaction includes a
+checksum for the preceding bytes of that transaction. Thus, if a transaction
+is only partially written, it will be possible to detect this via a checksum
+failure.
 
 It's worth noting that there are many places where checksums _aren't_ used, or
 rather, where they are not necessary for durability. For example, while each
@@ -1625,7 +1626,7 @@ segment includes a checksum, those checksums are never used for durability.
 They are only ever used for checking the integrity of the index, perhaps due to
 some other form of corruption. The reason why we don't need checksums for
 durability in segments is because segments are immutable. That is, before we
-wite a commit a transaction referencing a segment, we first make sure the
+write a commit a transaction referencing a segment, we first make sure the
 segment is durable, and only then do we start writing to the transaction log.
 Since we never subsequently mutate it, the presence of the transaction itself
 is a receipt that the segment is durable.

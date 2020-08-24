@@ -112,7 +112,7 @@ impl<B: AsRef<[u8]>> Cursor<B> {
         }
         Ok(Cursor {
             bytes: &self.as_slice()[..r.end],
-            pos: Cell::new(self.pos()),
+            pos: Cell::new(self.pos() + r.start),
         })
     }
 
