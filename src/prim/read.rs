@@ -91,6 +91,12 @@ impl<B: AsRef<[u8]>> Cursor<B> {
         }
     }
 
+    /// Return a new cursor whose position is always set to `0` such that `0`
+    /// corresponds to the current position of this cursor.
+    pub fn zero(&self) -> Cursor<&[u8]> {
+        Cursor { bytes: &self.as_slice()[self.pos()..], pos: Cell::new(0) }
+    }
+
     /// Return a sub-range of this cursor.
     ///
     /// The range given should be in terms of the unconsumed bytes in this

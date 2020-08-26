@@ -82,25 +82,27 @@ impl<B: AsRef<[u8]>> Reader<B> {
         })
     }
 
+    /// Search for an entry in this map corresponding to the given key. If one
+    /// does not exist, then None is returned. If the map is improperly
+    /// encoded, then this returns an error.
     fn binary_search(
         &self,
         needle: &[u8],
     ) -> Result<Option<&[u8]>, FormatError> {
         let offsets = self.read_key_offsets()?;
+        // This makes it so position 0 corresponds to the start of the first
+        // offset.
+        let offsets = offsets.zero();
         // since each offset is a u64LE
         assert_eq!(offsets.len() % 8, 0, "offsets must be a multiple of 8");
 
         let (mut left, mut right) = (0, (offsets.len() / 8) / 2);
         while left < right {
             let mid = (left + right) / 2;
-            // TODO: Fix this. Maybe push this down a bit so we can use
-            // ReadCursor? Not quite sure how though. We know the slice
-            // calculation is fine, but we don't know the conversion to usize
-            // is. Would be nice to not have to re-roll that error handling
-            // here.
-            let offset = u64::from_le_bytes(
-                offsets[mid * 8..mid * 8 + 8].try_into().unwrap(),
-            ) as usize;
+            offsets.set_pos(mid * 8).context("failed to set map midpoint")?;
+            let offset = offsets
+                .read_usize_le()
+                .context("failed to read map offset")?;
             let key = self.read_key(offset)?;
             if needle < key {
                 right = mid;
@@ -113,18 +115,27 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(None)
     }
 
+    /// Read the map key associated with the entry starting at the given
+    /// offset.
     fn read_key(&self, offset: usize) -> Result<&[u8], FormatError> {
         self.cursor.set_pos(offset).context("invalid map key offset")?;
         self.cursor.read_prefixed_bytes()
     }
 
-    fn read_key_offsets(&self) -> Result<&[u8], FormatError> {
+    /// Return a cursor corresponding to the sequence of u64LE offsets in this
+    /// map. There is one offset for each key in the map, and the order of the
+    /// offsets corresponds to the order of the map entries. Each offset points
+    /// to the start of a map entry.
+    ///
+    /// The cursor returned is positioned at the beginning of the offsets and
+    /// ends at the end of the offsets.
+    fn read_key_offsets(&self) -> Result<ReadCursor<&[u8]>, FormatError> {
         // Will always succeed since we check this at construction.
         self.cursor.set_pos(self.start).unwrap();
         // Each offset is a u64LE and there are `self.len` of them.
         let offsets = self
             .cursor
-            .read_slice(0..(8 * self.len))
+            .read_range(0..(8 * self.len))
             .context("failed to read map key offsets")?;
         // It'd be nicer if we could just return a &[u64] here, but that would
         // require dealing with safety by ensuring correct alignment. Instead
