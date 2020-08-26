@@ -42,9 +42,9 @@ pub struct Writer {
 /// case that all the keys will be. Since opening a segment should generally
 /// be as cheap as possible, we follow through with that here.
 #[derive(Debug)]
-pub struct Reader<B> {
+pub struct Reader<'a> {
     /// The bytes from which to read the map.
-    cursor: ReadCursor<B>,
+    cursor: ReadCursor<'a>,
     /// The position (into `cursor`) at which the encoding of the offsets of
     /// the map's entries starts. The offsets are a contiguous range of u64LEs
     /// that point to each key, where offsets are in the same order as the keys
@@ -59,10 +59,10 @@ pub struct Reader<B> {
     cache: Arc<Mutex<BTreeMap<String, Value>>>,
 }
 
-impl<B: AsRef<[u8]>> Reader<B> {
+impl<'a> Reader<'a> {
     /// Create a new map reader from the given cursor. The end of the cursor
     /// should correspond to the end of the serialized bytes for the map.
-    pub fn new(cursor: ReadCursor<B>) -> Result<Reader<B>, FormatError> {
+    pub fn new(cursor: ReadCursor<'a>) -> Result<Reader<'a>, FormatError> {
         // start (u64) + len (u64)
         cursor
             .set_pos_rev(8 + 8)
@@ -90,9 +90,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         needle: &[u8],
     ) -> Result<Option<&[u8]>, FormatError> {
         let offsets = self.read_key_offsets()?;
-        // This makes it so position 0 corresponds to the start of the first
-        // offset.
-        let offsets = offsets.zero();
         // since each offset is a u64LE
         assert_eq!(offsets.len() % 8, 0, "offsets must be a multiple of 8");
 
@@ -103,7 +100,7 @@ impl<B: AsRef<[u8]>> Reader<B> {
             let offset = offsets
                 .read_usize_le()
                 .context("failed to read map offset")?;
-            let key = self.read_key(offset)?;
+            let key = self.read_key_at(offset)?;
             if needle < key {
                 right = mid;
             } else if needle > key {
@@ -117,7 +114,7 @@ impl<B: AsRef<[u8]>> Reader<B> {
 
     /// Read the map key associated with the entry starting at the given
     /// offset.
-    fn read_key(&self, offset: usize) -> Result<&[u8], FormatError> {
+    fn read_key_at(&self, offset: usize) -> Result<&[u8], FormatError> {
         self.cursor.set_pos(offset).context("invalid map key offset")?;
         self.cursor.read_prefixed_bytes()
     }
@@ -127,16 +124,17 @@ impl<B: AsRef<[u8]>> Reader<B> {
     /// offsets corresponds to the order of the map entries. Each offset points
     /// to the start of a map entry.
     ///
-    /// The cursor returned is positioned at the beginning of the offsets and
-    /// ends at the end of the offsets.
-    fn read_key_offsets(&self) -> Result<ReadCursor<&[u8]>, FormatError> {
+    /// The cursor returned is zeroed at the beginning of the offsets and ends
+    /// at the end of the offsets.
+    fn read_key_offsets(&self) -> Result<ReadCursor<'a>, FormatError> {
         // Will always succeed since we check this at construction.
         self.cursor.set_pos(self.start).unwrap();
         // Each offset is a u64LE and there are `self.len` of them.
         let offsets = self
             .cursor
             .read_range(0..(8 * self.len))
-            .context("failed to read map key offsets")?;
+            .context("failed to read map key offsets")?
+            .zero();
         // It'd be nicer if we could just return a &[u64] here, but that would
         // require dealing with safety by ensuring correct alignment. Instead
         // we just grin and bare dealing with &[u8] directly.

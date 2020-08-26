@@ -19,20 +19,37 @@ use crate::prim::varint;
 ///
 /// If necessary, callers can move the cursor backwards to a previous position.
 #[derive(Clone, Debug)]
-pub struct Cursor<B> {
-    bytes: B,
+pub struct Cursor<'a> {
+    /// The bytes to read from.
+    ///
+    /// It would be more flexible to use `T: AsRef<[u8]>` instead of a concrete
+    /// `&[u8]`, since that would let us wrap a cursor over a number of types,
+    /// like a `Vec<u8>` or even a `Mmap`. But since it permits ownership, it
+    /// means that we cannot return a subslice with a lifetime connected to
+    /// the original slice, rather, it must be connected to the lifetime of
+    /// the cursor itself. This inhibits composition more than I'd like. Since
+    /// everything can be represented as a `&[u8]`, this just requires a mildly
+    /// annoying translation step from an owned source of bytes before using
+    /// a cursor, but it can be done once for each high level operation, and
+    /// so its cost is immaterial. But it does mean we need more book-keeping
+    /// types, which is a little unfortunate.
+    bytes: &'a [u8],
+    /// The current position of this cursor. All methods, unless otherwise
+    /// marked, start reading from `bytes` at this position. Similarly, methods
+    /// starting with a `read_` prefix will automatically advance this position
+    /// forward by the number of bytes read.
     pos: Cell<usize>,
 }
 
-impl<B: AsRef<[u8]>> Cursor<B> {
+impl<'a> Cursor<'a> {
     /// Create a new cursor for a byte slice.
-    pub fn new(bytes: B) -> Cursor<B> {
+    pub fn new(bytes: &'a [u8]) -> Cursor<'a> {
         Cursor { bytes, pos: Cell::new(0) }
     }
 
     /// Return the remaining bytes in this cursor. That is, all bytes in this
     /// cursor starting from the cursor's current position.
-    pub fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &'a [u8] {
         &self.bytes.as_ref()[self.pos()..]
     }
 
@@ -93,7 +110,7 @@ impl<B: AsRef<[u8]>> Cursor<B> {
 
     /// Return a new cursor whose position is always set to `0` such that `0`
     /// corresponds to the current position of this cursor.
-    pub fn zero(&self) -> Cursor<&[u8]> {
+    pub fn zero(&self) -> Cursor<'a> {
         Cursor { bytes: &self.as_slice()[self.pos()..], pos: Cell::new(0) }
     }
 
@@ -109,10 +126,7 @@ impl<B: AsRef<[u8]>> Cursor<B> {
     /// To consume a range of bytes, use `read_range`.
     ///
     /// If the given range is not valid, then this returns an error.
-    pub fn range(
-        &self,
-        r: Range<usize>,
-    ) -> Result<Cursor<&[u8]>, FormatError> {
+    pub fn range(&self, r: Range<usize>) -> Result<Cursor<'a>, FormatError> {
         if self.as_slice().get(r.clone()).is_none() {
             bail_format!("invalid cursor range {:?}", r);
         }
@@ -128,7 +142,7 @@ impl<B: AsRef<[u8]>> Cursor<B> {
     pub fn read_range(
         &self,
         r: Range<usize>,
-    ) -> Result<Cursor<&[u8]>, FormatError> {
+    ) -> Result<Cursor<'a>, FormatError> {
         let cursor = self.range(r)?;
         self.inc(cursor.len())?;
         Ok(cursor)
@@ -139,7 +153,10 @@ impl<B: AsRef<[u8]>> Cursor<B> {
     ///
     /// (This is like `read_range`, except it returns raw bytes instead of
     /// another cursor.)
-    pub fn read_slice(&self, r: Range<usize>) -> Result<&[u8], FormatError> {
+    pub fn read_slice(
+        &self,
+        r: Range<usize>,
+    ) -> Result<&'a [u8], FormatError> {
         let bytes = match self.as_slice().get(r.clone()) {
             None => bail_format!("invalid slice range {:?}", r),
             Some(bytes) => bytes,
@@ -199,21 +216,21 @@ impl<B: AsRef<[u8]>> Cursor<B> {
 
     /// Read a length prefixed byte string. The length prefix should be a
     /// varint.
-    pub fn read_prefixed_bytes(&self) -> Result<&[u8], FormatError> {
+    pub fn read_prefixed_bytes(&self) -> Result<&'a [u8], FormatError> {
         let len = self.read_varusize()?;
         self.read_slice(0..len)
     }
 
     /// Read a length prefixed UTF-8 encoded string, where the length prefix is
     /// a varint. This returns an error if the bytes are invalid UTF-8.
-    pub fn read_prefixed_str(&self) -> Result<&str, FormatError> {
+    pub fn read_prefixed_str(&self) -> Result<&'a str, FormatError> {
         let bytes = self.read_prefixed_bytes()?;
         std::str::from_utf8(bytes)
             .context("invalid UTF-8 in fixed length string")
     }
 
     /// Interpret the remaining bytes in this cursor as an FST and return it.
-    pub fn read_fst(&self) -> Result<Fst<&[u8]>, FormatError> {
+    pub fn read_fst(&self) -> Result<Fst<&'a [u8]>, FormatError> {
         let fst = Fst::new(self.as_slice()).context("could not read FST")?;
         self.inc(self.as_slice().len())?;
         Ok(fst)

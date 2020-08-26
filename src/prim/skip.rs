@@ -17,9 +17,9 @@ use crate::prim::{ReadCursor, WriteCursor};
 /// The `'a` lifetime parameter refers to the lifetime of the slice of bytes
 /// that this skip reader reads from.
 #[derive(Debug)]
-pub struct Reader<B> {
+pub struct Reader<'a> {
     /// The region of bytes from which to read skip entries.
-    cursor: ReadCursor<B>,
+    cursor: ReadCursor<'a>,
     /// The start offset (into `bytes`) of the first skip in level 0.
     start: usize,
     /// The number of levels in this skip list. A skip list with zero levels
@@ -31,10 +31,10 @@ pub struct Reader<B> {
     max: u32,
 }
 
-impl<B: AsRef<[u8]>> Reader<B> {
+impl<'a> Reader<'a> {
     /// Create a new reader for a skip list. The cursor given may begin
     /// anywhere, but must end immediately where the skip list ends.
-    pub fn new(cursor: ReadCursor<B>) -> Result<Reader<B>, FormatError> {
+    pub fn new(cursor: ReadCursor<'a>) -> Result<Reader<'a>, FormatError> {
         // start (u64) + levels (u64) + min (u32) + max (u32)
         cursor
             .set_pos_rev(8 + 8 + 4 + 4)
@@ -491,11 +491,11 @@ mod tests {
         cursor.into_inner()
     }
 
-    fn deserialize(bytes: &[u8]) -> Reader<&[u8]> {
+    fn deserialize(bytes: &[u8]) -> Reader<'_> {
         Reader::new(ReadCursor::new(bytes)).unwrap()
     }
 
-    fn skip_to(rdr: &Reader<&[u8]>, value: u32) -> Option<usize> {
+    fn skip_to(rdr: &Reader<'_>, value: u32) -> Option<usize> {
         rdr.skip_to(value).unwrap()
     }
 
