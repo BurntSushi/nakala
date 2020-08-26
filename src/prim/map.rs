@@ -13,10 +13,10 @@ use crate::prim::ReadCursor;
 /// type of its data a priori.
 #[derive(Debug)]
 enum Value {
+    Bytes(Arc<[u8]>),
     String(Arc<str>),
-    Bytes(Vec<u8>),
+    OffsetRange(usize, usize),
     Int(u64),
-    Range(u64, u64),
 }
 
 /// A writer for serializing a map from UTF-8 encoded string keys to a
@@ -40,7 +40,8 @@ pub struct Writer {
 /// recording purposes. To that end, while some keys in a map may always be
 /// necessary to deserialize in order to read a segment, it will never be the
 /// case that all the keys will be. Since opening a segment should generally
-/// be as cheap as possible, we follow through with that here.
+/// be as cheap as possible, we follow through with that here by using a "lazy"
+/// strategy.
 #[derive(Debug)]
 pub struct Reader<'a> {
     /// The bytes from which to read the map.
@@ -117,6 +118,50 @@ impl<'a> Reader<'a> {
     fn read_key_at(&self, offset: usize) -> Result<&[u8], FormatError> {
         self.cursor.set_pos(offset).context("invalid map key offset")?;
         self.cursor.read_prefixed_bytes()
+    }
+
+    /// Read the map value starting at the current position. If there was a
+    /// problem reading the value, then an error is returned.
+    fn read_value(&self) -> Result<Value, FormatError> {
+        let tag = self
+            .cursor
+            .read_u16_le()
+            .context("failed to read map value type tag")?;
+        match tag {
+            1 => {
+                let bytes = self
+                    .cursor
+                    .read_prefixed_bytes()
+                    .context("failed to read map value 'bytes'")?;
+                Ok(Value::Bytes(Arc::from(bytes)))
+            }
+            2 => {
+                let string = self
+                    .cursor
+                    .read_prefixed_str()
+                    .context("failed to read map value 'string'")?;
+                Ok(Value::String(Arc::from(string)))
+            }
+            3 => {
+                let start = self
+                    .cursor
+                    .read_usize_le()
+                    .context("failed to read map value 'start of range'")?;
+                let end = self
+                    .cursor
+                    .read_usize_le()
+                    .context("failed to read map value 'end of range'")?;
+                Ok(Value::OffsetRange(start, end))
+            }
+            4 => {
+                let n = self
+                    .cursor
+                    .read_u64_le()
+                    .context("failed to read map value 'int'")?;
+                Ok(Value::Int(n))
+            }
+            unk => bail_format!("unknown map value type tag: {}", unk),
+        }
     }
 
     /// Return a cursor corresponding to the sequence of u64LE offsets in this
