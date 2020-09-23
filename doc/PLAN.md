@@ -798,10 +798,14 @@ so you actually wind up feeling liberated. If we had no locking at all, then
 it's possible we might be able to support one writer and many readers and we'd
 have to tell the user that they are responsible for ensuring there is only one
 writer. Which is annoying. We could add a tiny amount of locking for enforcing
-the single writer rule, which would make this better. But a single writer means
-1) you can't use multiple processes to index data, 2) you need to be a bit more
-careful and 3) the Nakala API probably needs distinct `Writer` and `Reader`
-types. (N.B. "single" writer in this context means that while a writer is open
+the single writer rule, which would make this better. But a single writer
+means:
+
+1. you can't use multiple processes to index data
+2. you need to be a bit more careful and
+3. the Nakala API probably needs distinct `Writer` and `Reader` types.
+
+(N.B. "single" writer in this context means that while a writer is open
 in memory in one process, no other process can open a writer. If we did use
 the simplistic locking scheme for this, it would correspond to very coarsely
 grained locking.)
@@ -815,12 +819,17 @@ problems with this approach as I see it:
    remove rogue lock files. (Most likely, we would make timeouts an optional
    feature.) Namely, with OS-native advisory locks, the locks are automatically
    unlocked if the process dies (or the corresponding file descriptor is closed
-   for any reason).
+   for any reason). This is a significant problem primarily because Nakala is
+   an embedded database, which means code that is touching the database can be
+   terminated at any point and we generally can't rely on "graceful
+   termination."
 2. They are really only good for exclusive locks. Which means we can't do
    something like, "lock these specific bytes in this segment tombstone file,"
    which would permit multiple processes to delete documents from the same
    segment simultaneously. Although, above we concluded that we should just
    avoid synchronization here altogether and use a full byte for each document.
+   But still, only having exclusive locks also means you can't have shared
+   locking where either one writer is allowed or many readers are.
 
 At this point in time, it's hard to say with much certaintly how important (2)
 is, but my instinct is that we really should reduce contention as much as
@@ -853,17 +862,17 @@ indicate variables. Files that are transient or are otherwise only intended for
 use in synchronization are in brackets. File names that end with a `?` imply
 that they are only used on some platforms/environments.
 
-  {index-name}/
-    transaction.log
-    [transaction.log.rollback]
-    [transaction.log.lock]? (non-Linux/Windows)
-    segment.{segmentID}.idx
-    segment.{segmentID}.tomb
-    [segment.{segmentID}.idmap] (ensuring ACID for deletes)
-    merges/
-      {transactionID}.active
-    handles/
-      {handleID}.active
+    {index-name}/
+      transaction.log
+      [transaction.log.rollback]
+      [transaction.log.lock]? (non-Linux/Windows)
+      segment.{segmentID}.idx
+      segment.{segmentID}.tomb
+      [segment.{segmentID}.idmap] (ensuring ACID for deletes)
+      merges/
+        {transactionID}.active
+      handles/
+        {handleID}.active
 
 Sadly, my hope to use the simplest possible file locking scheme kind of failed,
 because the above structure requires the use of four different lock APIs.
@@ -876,7 +885,7 @@ time:
   lock files are never needed.
 * On all other platforms (including macOS), the old school `O_EXCL` lock file
   approach is used for `transaction.log.lock`, while POSIX `fcntl` locks are
-  used for merges/{transactionID}.log` and `handles/{handleID.log}`.
+  used for `merges/{transactionID}.log` and `handles/{handleID.log}`.
 
 TODO: Revise this section. We really probably want `flock` on macOS for the
 transaction log, so that we can support creating many readers simultaneously.
@@ -986,7 +995,7 @@ synchronization:
   (optionally) merged together.
 * Reading from a segment index also doesn't require synchronization, as once a
   segment index has been written, it is never modified again.
-* Reading/writing tombstones to segments needs no synchronization between the
+* Reading/writing tombstones to segments needs no synchronization because the
   deletion status of each document is represented by a single byte. So writing
   a tombstone always means writing the byte `0xFF`. Even if two processes race,
   it doesn't matter which wins, so long as `0xFF` gets written.
@@ -1007,7 +1016,7 @@ with other threads within the same process. (So that rules out POSIX locks.)
 Once a shared lock is obtained, it makes note of the ID of the most recent
 entry in the log. The handle then assigns itself an ID (say, from the current
 timestamp) and attempts to create a new file with `O_EXCL` set with the name
-`{logid}\_{handleid}`. If it doesn't succeed, then the handle should generate a
+`{logid}_{handleid}`. If it doesn't succeed, then the handle should generate a
 new ID and try again. If it does, then the handle should acquire an exclusive
 lock on this file. The handle should then read the contents of the transaction
 log into memory (explained in the next paragraph). Once done, the handle can
@@ -1119,7 +1128,7 @@ common access pattern will be something like:
 * Exit process.
 
 In most runs, exiting the process should hopefully include closing the handle.
-At minimum, we can do this inside a Rust destructor proactive, so the caller
+At minimum, we can do this inside a Rust destructor proactively, so the caller
 doesn't even need to be counted on to do it. But, destructors aren't guaranteed
 to run. The caller might call `process::exit(0)` for example. Or perhaps the
 user will `^C` the process, and the caller might not have a signal handler
@@ -1261,9 +1270,10 @@ things:
        longer exist or have been written as tombstones to their corresponding
        segment. (Note that writing tombstones occurs as part of this compaction
        process.)
-   Note that the above means that a transaction entry `B` that occurs after `A`
-   may actually be removed before `A` is, leaving "gaps" in the log. But this
-   is okay.
+
+Note that the above means that a transaction entry `B` that occurs after `A`
+may actually be removed before `A` is, leaving "gaps" in the log. But this is
+okay.
 
 As you can see, most of the complexity of compaction actually involves deciding
 what to do with each log entry. One of the key complexities of the transaction
@@ -1371,6 +1381,12 @@ completing compaction. Although, if deletes are truly streaming in that
 quickly, then its likely we will be spending a lot of time in compaction, so
 there will probably be other things to tweak.
 
+Another possibility would be to introduce a separate synchronization mechanism
+indicating that a compaction process is in progress. Then we could drop the
+transaction log lock without dropping the compaction lock and allow other
+processes to make progress. When compaction resumes, however, we'll need to be
+careful to deal with any new entries that may have been added. However, we'll
+at least know that no intervening compaction occurred.
 
 ## ACID
 
