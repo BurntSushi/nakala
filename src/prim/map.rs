@@ -5,6 +5,12 @@ use std::sync::{Arc, Mutex};
 use crate::error::{FormatContext, FormatError};
 use crate::prim::ReadCursor;
 
+/// The integers corresponding to each of the possible values in a map.
+const TAG_BYTES: u16 = 1;
+const TAG_STRING: u16 = 2;
+const TAG_OFFSET_RANGE: u16 = 3;
+const TAG_INT: u16 = 4;
+
 /// The restricted set of values that a map can contain.
 ///
 /// This may be expanded. It exists so that there is a defined closed set of
@@ -83,13 +89,31 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// Search for an entry in this map corresponding to the given key. If one
-    /// does not exist, then None is returned. If the map is improperly
-    /// encoded, then this returns an error.
-    fn binary_search(
+    /// Read the bytes associated with the given key. If no such key exists,
+    /// then None is returned. If a key exists but is not a byte string, then
+    /// this returns an error.
+    pub fn get_bytes<B: AsRef<[u8]>>(
         &self,
-        needle: &[u8],
-    ) -> Result<Option<&[u8]>, FormatError> {
+        key: B,
+    ) -> Result<Option<Arc<[u8]>>, FormatError> {
+        todo!()
+    }
+
+    /// Read the map value corresponding to the given key. If no such key
+    /// exists, then None is returned. If the map is corrupt, then an error is
+    /// returned.
+    fn read_value(&self, key: &[u8]) -> Result<Option<Value>, FormatError> {
+        if !self.binary_search(key)? {
+            return Ok(None);
+        }
+        self.read_current_value().map(Some)
+    }
+
+    /// Search for an entry in this map corresponding to the given key. If one
+    /// does not exist, then false is returned. If one does exist, then true
+    /// is returned and the internal reader is positioned at the start of the
+    /// corresponding value. If the map is corrupt, then this returns an error.
+    fn binary_search(&self, needle: &[u8]) -> Result<bool, FormatError> {
         let offsets = self.read_key_offsets()?;
         // since each offset is a u64LE
         assert_eq!(offsets.len() % 8, 0, "offsets must be a multiple of 8");
@@ -107,10 +131,10 @@ impl<'a> Reader<'a> {
             } else if needle > key {
                 left = mid + 1;
             } else {
-                return Ok(Some(key));
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     /// Read the map key associated with the entry starting at the given
@@ -122,27 +146,27 @@ impl<'a> Reader<'a> {
 
     /// Read the map value starting at the current position. If there was a
     /// problem reading the value, then an error is returned.
-    fn read_value(&self) -> Result<Value, FormatError> {
+    fn read_current_value(&self) -> Result<Value, FormatError> {
         let tag = self
             .cursor
             .read_u16_le()
             .context("failed to read map value type tag")?;
         match tag {
-            1 => {
+            TAG_BYTES => {
                 let bytes = self
                     .cursor
                     .read_prefixed_bytes()
                     .context("failed to read map value 'bytes'")?;
                 Ok(Value::Bytes(Arc::from(bytes)))
             }
-            2 => {
+            TAG_STRING => {
                 let string = self
                     .cursor
                     .read_prefixed_str()
                     .context("failed to read map value 'string'")?;
                 Ok(Value::String(Arc::from(string)))
             }
-            3 => {
+            TAG_OFFSET_RANGE => {
                 let start = self
                     .cursor
                     .read_usize_le()
@@ -153,7 +177,7 @@ impl<'a> Reader<'a> {
                     .context("failed to read map value 'end of range'")?;
                 Ok(Value::OffsetRange(start, end))
             }
-            4 => {
+            TAG_INT => {
                 let n = self
                     .cursor
                     .read_u64_le()
