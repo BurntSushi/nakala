@@ -1,3 +1,7 @@
+# THIS IS A WORK IN PROGRESS
+
+Please see the [PLAN](doc/PLAN.md) document for current design work.
+
 nakala
 ======
 A low level information retrieval library.
